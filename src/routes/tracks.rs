@@ -1,7 +1,54 @@
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use deadpool_sqlite::Pool;
+use parking_lot::Mutex;
+use serde::Serialize;
 use crate::{db::queries, error::AppError, models::{Page, track::{Track, TrackQueryParams}}};
+
+const OBSERVATORY_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Clone)]
+pub struct ObservatoryCache(pub Arc<Mutex<Option<(Instant, Vec<Track>)>>>);
+
+impl ObservatoryCache {
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+}
+
+#[derive(Serialize)]
+pub struct ObservatoryPage {
+    pub total: usize,
+    pub items: Vec<Track>,
+}
+
+/// Returns all tracks that have sonic_analysis, optimised for the observatory bulk fetch.
+/// Drives the JOIN from audio_analysis (7K rows) rather than tracks (37K+), and caches
+/// the full result for OBSERVATORY_TTL so repeated page-loads are instant.
+pub async fn observatory_tracks(
+    State((pool, cache)): State<(Pool, ObservatoryCache)>,
+) -> Result<Json<ObservatoryPage>, AppError> {
+    // Serve from cache if still fresh.
+    {
+        let guard = cache.0.lock();
+        if let Some((ts, ref tracks)) = *guard {
+            if ts.elapsed() < OBSERVATORY_TTL {
+                return Ok(Json(ObservatoryPage { total: tracks.len(), items: tracks.clone() }));
+            }
+        }
+    }
+
+    // Cache miss — run the query.
+    let tracks = pool.get().await?
+        .interact(|conn| queries::observatory_tracks(conn))
+        .await.map_err(|e| anyhow::anyhow!("{e}"))??;
+
+    let total = tracks.len();
+    *cache.0.lock() = Some((Instant::now(), tracks.clone()));
+    Ok(Json(ObservatoryPage { total, items: tracks }))
+}
 
 pub async fn list_tracks(
     State(pool): State<Pool>,

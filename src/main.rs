@@ -14,6 +14,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use config::Config;
 use routes::cover::{new_cover_cache, album_cover, track_cover};
+use routes::tracks::ObservatoryCache;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -45,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let observatory_cache = ObservatoryCache::new();
     let cover_cache = new_cover_cache();
     let music_root = cfg.music_root.clone();
     let track_cover_state = (pool.clone(), music_root.clone(), cover_cache.clone());
@@ -54,6 +56,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(routes::health::health))
         .route("/health/detailed", get(routes::health::health_detailed).with_state(pool.clone()))
         .route("/tracks", get(routes::tracks::list_tracks).with_state(pool.clone()))
+        .route("/tracks/observatory",
+            get(routes::tracks::observatory_tracks)
+                .with_state((pool.clone(), observatory_cache)))
         .route("/tracks/:id", get(routes::tracks::get_track).with_state(pool.clone()))
         .route("/tracks/:id/similar",
             get(routes::similar::similar_tracks)

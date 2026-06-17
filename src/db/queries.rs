@@ -84,7 +84,164 @@ LEFT JOIN audio_analysis aa_sonic
 WHERE pm.provider_item_id IS NOT NULL
 ";
 
-pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_clap: bool) -> rusqlite::Result<Track> {
+// Scalar-only variant: extracts individual fields via json_extract() so SQLite
+// transmits only the values we need instead of the full analysis_data blobs.
+// The sonic_analysis blob contains a 1024-dim CLAP embedding + beats array;
+// transmitting it for thousands of rows is expensive. This reduces per-row
+// transfer from ~10KB to ~200 bytes — used when include=analysis_scalar.
+const TRACK_BASE_SCALAR: &str = "
+SELECT
+  t.item_id,
+  t.name,
+  t.duration,
+  t.favorite,
+  t.timestamp_added,
+  t.timestamp_modified,
+  t.metadata,
+  GROUP_CONCAT(DISTINCT a.name) AS artists,
+  alb.name AS album,
+  alb.year,
+  alb.item_id AS album_id,
+  pm.provider_item_id AS file_path,
+  CAST(json_extract(aa_loud.analysis_data, '$.loudness_integrated') AS REAL) AS loudness_lufs,
+  CAST(json_extract(aa_loud.analysis_data, '$.loudness_album') AS REAL) AS loudness_album_lufs,
+  CAST(json_extract(aa_fades.analysis_data, '$.bpm') AS REAL) AS bpm,
+  json_extract(aa_fades.analysis_data, '$.key') AS fkey,
+  json_extract(aa_fades.analysis_data, '$.mode') AS fmode,
+  CAST(json_extract(aa_sonic.analysis_data, '$.energy') AS REAL) AS energy,
+  CAST(json_extract(aa_sonic.analysis_data, '$.valence') AS REAL) AS valence,
+  CAST(json_extract(aa_sonic.analysis_data, '$.danceability') AS REAL) AS danceability,
+  CAST(json_extract(aa_sonic.analysis_data, '$.arousal') AS REAL) AS arousal,
+  CAST(json_extract(aa_sonic.analysis_data, '$.acousticness') AS REAL) AS acousticness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.instrumentalness') AS REAL) AS instrumentalness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.brightness') AS REAL) AS brightness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.speechiness') AS REAL) AS speechiness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.roughness') AS REAL) AS roughness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.harmonic_complexity') AS REAL) AS harmonic_complexity,
+  CAST(json_extract(aa_sonic.analysis_data, '$.rhythmic_regularity') AS REAL) AS rhythmic_regularity,
+  CAST(json_extract(aa_sonic.analysis_data, '$.spectral_centroid') AS REAL) AS spectral_centroid
+FROM tracks t
+LEFT JOIN track_artists ta ON ta.track_id = t.item_id
+LEFT JOIN artists a ON a.item_id = ta.artist_id
+LEFT JOIN album_tracks at2 ON at2.track_id = t.item_id
+LEFT JOIN albums alb ON alb.item_id = at2.album_id
+LEFT JOIN provider_mappings pm
+  ON pm.item_id = t.item_id AND pm.media_type='track' AND pm.provider_domain='filesystem_local'
+LEFT JOIN audio_analysis aa_loud
+  ON aa_loud.item_id = pm.provider_item_id AND aa_loud.aa_provider_domain='loudness_analysis'
+LEFT JOIN audio_analysis aa_fades
+  ON aa_fades.item_id = pm.provider_item_id AND aa_fades.aa_provider_domain='smart_fades'
+LEFT JOIN audio_analysis aa_sonic
+  ON aa_sonic.item_id = pm.provider_item_id AND aa_sonic.aa_provider_domain='sonic_analysis'
+WHERE pm.provider_item_id IS NOT NULL
+";
+
+// Row parser for TRACK_BASE_SCALAR — reads pre-extracted scalar columns instead
+// of full JSON blobs. Column layout must match TRACK_BASE_SCALAR exactly.
+pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
+    let id: i64 = row.get(0)?;
+    let title: Option<String> = row.get(1)?;
+    let duration: Option<f64> = row.get(2)?;
+    let favorite: Option<bool> = row.get(3)?;
+    let timestamp_added: Option<i64> = row.get(4)?;
+    let timestamp_modified: Option<i64> = row.get(5)?;
+    let metadata_str: Option<String> = row.get(6)?;
+    let artists_str: Option<String> = row.get(7)?;
+    let album: Option<String> = row.get(8)?;
+    let year: Option<i64> = row.get(9)?;
+    let album_id: Option<i64> = row.get(10)?;
+    let file_path: Option<String> = row.get(11)?;
+    // Pre-extracted scalars from json_extract() — column 12 onwards.
+    let loudness_lufs: Option<f64> = row.get(12)?;
+    let loudness_album_lufs: Option<f64> = row.get(13)?;
+    let bpm: Option<f64> = row.get(14)?;
+    let key: Option<String> = row.get(15)?;
+    let mode: Option<String> = row.get(16)?;
+    let energy: Option<f64> = row.get(17)?;
+    let valence: Option<f64> = row.get(18)?;
+    let danceability: Option<f64> = row.get(19)?;
+    let arousal: Option<f64> = row.get(20)?;
+    let acousticness: Option<f64> = row.get(21)?;
+    let instrumentalness: Option<f64> = row.get(22)?;
+    let brightness: Option<f64> = row.get(23)?;
+    let speechiness: Option<f64> = row.get(24)?;
+    let roughness: Option<f64> = row.get(25)?;
+    let harmonic_complexity: Option<f64> = row.get(26)?;
+    let rhythmic_regularity: Option<f64> = row.get(27)?;
+    let spectral_centroid: Option<f64> = row.get(28)?;
+
+    let artists: Vec<String> = artists_str
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let artist = artists.first().cloned();
+
+    let metadata: Option<serde_json::Value> = metadata_str.as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let genre = metadata.as_ref()
+        .and_then(|m| m.get("genres"))
+        .and_then(|g| g.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let camelot = key.as_deref().zip(mode.as_deref())
+        .and_then(|(k, m)| to_camelot(k, m));
+
+    let has_any_analysis = loudness_lufs.is_some() || bpm.is_some() || energy.is_some();
+    let analysis = if has_any_analysis {
+        Some(TrackAnalysis {
+            loudness_lufs,
+            loudness_album_lufs,
+            bpm,
+            key,
+            mode,
+            camelot,
+            beats: None,
+            valence,
+            energy,
+            danceability,
+            arousal,
+            acousticness,
+            instrumentalness,
+            brightness,
+            speechiness,
+            roughness,
+            harmonic_complexity,
+            rhythmic_regularity,
+            spectral_centroid,
+            rms_energy: None,
+            mbid: None,
+            isrc: None,
+            clap_embedding: None,
+        })
+    } else {
+        None
+    };
+
+    Ok(Track {
+        id,
+        title,
+        artist,
+        artists,
+        album,
+        album_id,
+        year,
+        genre,
+        duration,
+        file_path,
+        favorite,
+        timestamp_added,
+        timestamp_modified,
+        cover_url: format!("/api/v1/tracks/{id}/cover"),
+        analysis,
+    })
+}
+
+pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arrays: bool, include_clap: bool) -> rusqlite::Result<Track> {
     let id: i64 = row.get(0)?;
     let title: Option<String> = row.get(1)?;
     let duration: Option<f64> = row.get(2)?;
@@ -127,15 +284,23 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_clap
         let mode = fades.as_ref().and_then(|v| v.get("mode")).and_then(|v| v.as_str()).map(String::from);
         let camelot = key.as_deref().zip(mode.as_deref()).and_then(|(k, m)| to_camelot(k, m));
 
-        let beats = fades.as_ref()
-            .and_then(|v| v.get("beats"))
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect());
+        let beats = if include_arrays {
+            fades.as_ref()
+                .and_then(|v| v.get("beats"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+        } else {
+            None
+        };
 
-        let rms_energy = sonic.as_ref()
-            .and_then(|v| v.get("rms_energy"))
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect());
+        let rms_energy = if include_arrays {
+            sonic.as_ref()
+                .and_then(|v| v.get("rms_energy"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+        } else {
+            None
+        };
 
         let clap_embedding = if include_clap {
             sonic.as_ref()
@@ -383,18 +548,195 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         let id_placeholders: Vec<String> = (1..=sampled_ids.len())
             .map(|i| format!("?{i}"))
             .collect();
-        let data_sql = format!(
-            "{TRACK_BASE} AND t.item_id IN ({})
-             GROUP BY t.item_id",
-            id_placeholders.join(",")
-        );
         let include_analysis = p.include_analysis();
+        let include_arrays = p.include_arrays();
         let include_clap = p.include_clap();
-        let mut stmt = conn.prepare(&data_sql)?;
-        let tracks: Vec<Track> = stmt.query_map(
-            rusqlite::params_from_iter(sampled_ids.iter()),
-            |row| parse_track_row(row, include_analysis, include_clap),
+
+        let tracks: Vec<Track> = if include_analysis && !include_arrays {
+            let data_sql = format!(
+                "{TRACK_BASE_SCALAR} AND t.item_id IN ({})
+                 GROUP BY t.item_id",
+                id_placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&data_sql)?;
+            let x = stmt.query_map(
+                rusqlite::params_from_iter(sampled_ids.iter()),
+                |row| parse_track_scalar_row(row),
+            )?.collect::<rusqlite::Result<_>>()?; x
+        } else {
+            let data_sql = format!(
+                "{TRACK_BASE} AND t.item_id IN ({})
+                 GROUP BY t.item_id",
+                id_placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&data_sql)?;
+            let x = stmt.query_map(
+                rusqlite::params_from_iter(sampled_ids.iter()),
+                |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
+            )?.collect::<rusqlite::Result<_>>()?; x
+        };
+
+        return Ok((total, tracks));
+    }
+
+    // Two-stage pagination fast path: use lightweight provider_mappings enumeration
+    // then fetch full rows only for the page's IDs. Same idea as the random fast path
+    // but with deterministic LIMIT/OFFSET ordering instead of RANDOM().
+    //
+    // Used when: not random AND (no audio filters OR sole filter is energy_min=0,
+    // which means "has sonic_analysis" — a JOIN presence check, not a value filter).
+    // This covers the Observatory bulk fetch (energy_min=0 to select analysed tracks).
+    let is_sonic_presence_only = p.energy_min == Some(0.0)
+        && p.energy_max.is_none()
+        && p.bpm_min.is_none() && p.bpm_max.is_none()
+        && p.valence_min.is_none() && p.valence_max.is_none()
+        && p.arousal_min.is_none() && p.arousal_max.is_none();
+    let use_two_stage_paged = !is_random && (!has_audio_filters || is_sonic_presence_only);
+
+    if use_two_stage_paged {
+        let mut pm_wheres: Vec<String> = vec![
+            "pm.media_type='track'".into(),
+            "pm.provider_domain='filesystem_local'".into(),
+        ];
+        let mut pm_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        if let Some(since) = p.since {
+            pm_wheres.push(format!("t.timestamp_modified > ?{}", pm_values.len() + 1));
+            pm_values.push(Box::new(since));
+        }
+        if let Some(fav) = p.favorite {
+            pm_wheres.push(format!("t.favorite = ?{}", pm_values.len() + 1));
+            pm_values.push(Box::new(fav as i64));
+        }
+        if let Some(ref genre) = p.genre {
+            pm_wheres.push(format!(
+                "json_extract(t.metadata, '$.genres[0]') = ?{}",
+                pm_values.len() + 1
+            ));
+            pm_values.push(Box::new(genre.clone()));
+        }
+        if let Some(artist_id) = p.artist_id {
+            pm_wheres.push(format!(
+                "EXISTS (SELECT 1 FROM track_artists ta2 WHERE ta2.track_id = t.item_id AND ta2.artist_id = ?{})",
+                pm_values.len() + 1
+            ));
+            pm_values.push(Box::new(artist_id));
+        }
+        if let Some(album_id) = p.album_id {
+            pm_wheres.push(format!(
+                "EXISTS (SELECT 1 FROM album_tracks at3 WHERE at3.track_id = t.item_id AND at3.album_id = ?{})",
+                pm_values.len() + 1
+            ));
+            pm_values.push(Box::new(album_id));
+        }
+        if !exclude_ids.is_empty() {
+            let placeholders: Vec<String> = (0..exclude_ids.len())
+                .map(|i| format!("?{}", pm_values.len() + i + 1))
+                .collect();
+            pm_wheres.push(format!("t.item_id NOT IN ({})", placeholders.join(",")));
+            for id in &exclude_ids {
+                pm_values.push(Box::new(*id));
+            }
+        }
+        let pm_where = pm_wheres.join(" AND ");
+
+        // For sonic_presence_only: inner-join to audio_analysis to keep only analysed tracks.
+        let (count_sql, id_sql_template) = if is_sonic_presence_only {
+            let count = format!(
+                "SELECT COUNT(DISTINCT pm.item_id)
+                 FROM provider_mappings pm
+                 JOIN tracks t ON t.item_id = pm.item_id
+                 JOIN audio_analysis aa_sonic ON aa_sonic.item_id = pm.provider_item_id
+                   AND aa_sonic.aa_provider_domain = 'sonic_analysis'
+                 WHERE {pm_where}"
+            );
+            // Use DISTINCT so duplicates from multiple aa_sonic rows per track don't
+            // eat into the LIMIT (the UNIQUE constraint is on 4 cols; same item_id can
+            // appear more than once if 'provider' differs).
+            let ids = format!(
+                "SELECT DISTINCT pm.item_id FROM provider_mappings pm
+                 JOIN tracks t ON t.item_id = pm.item_id
+                 JOIN audio_analysis aa_sonic ON aa_sonic.item_id = pm.provider_item_id
+                   AND aa_sonic.aa_provider_domain = 'sonic_analysis'
+                 WHERE {pm_where}
+                 ORDER BY pm.item_id ASC
+                 LIMIT ?{{limit}} OFFSET ?{{offset}}"
+            );
+            (count, ids)
+        } else {
+            let count = format!(
+                "SELECT COUNT(DISTINCT t.item_id)
+                 FROM tracks t
+                 JOIN provider_mappings pm ON pm.item_id = t.item_id
+                 WHERE {pm_where}"
+            );
+            let ids = format!(
+                "SELECT DISTINCT pm.item_id FROM provider_mappings pm
+                 JOIN tracks t ON t.item_id = pm.item_id
+                 WHERE {pm_where}
+                 ORDER BY pm.item_id ASC
+                 LIMIT ?{{limit}} OFFSET ?{{offset}}"
+            );
+            (count, ids)
+        };
+
+        let total: i64 = conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(pm_values.iter()),
+            |r| r.get(0),
+        )?;
+
+        // Bind LIMIT and OFFSET, replacing the placeholder templates.
+        let limit_pos = pm_values.len() + 1;
+        let offset_pos = pm_values.len() + 2;
+        let id_sql = id_sql_template
+            .replace("{limit}", &limit_pos.to_string())
+            .replace("{offset}", &offset_pos.to_string());
+        pm_values.push(Box::new(limit));
+        pm_values.push(Box::new(offset));
+
+        let mut id_stmt = conn.prepare(&id_sql)?;
+        let page_ids: Vec<i64> = id_stmt.query_map(
+            rusqlite::params_from_iter(pm_values.iter()),
+            |row| row.get(0),
         )?.collect::<rusqlite::Result<_>>()?;
+
+        if page_ids.is_empty() {
+            return Ok((total, vec![]));
+        }
+
+        let id_placeholders: Vec<String> = (1..=page_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect();
+        let include_analysis = p.include_analysis();
+        let include_arrays = p.include_arrays();
+        let include_clap = p.include_clap();
+
+        // Use the scalar base query when arrays aren't needed — avoids transmitting
+        // the full analysis_data blobs (CLAP embeddings, beats arrays) from SQLite.
+        let tracks: Vec<Track> = if include_analysis && !include_arrays {
+            let data_sql = format!(
+                "{TRACK_BASE_SCALAR} AND t.item_id IN ({})
+                 GROUP BY t.item_id",
+                id_placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&data_sql)?;
+            let x = stmt.query_map(
+                rusqlite::params_from_iter(page_ids.iter()),
+                |row| parse_track_scalar_row(row),
+            )?.collect::<rusqlite::Result<_>>()?; x
+        } else {
+            let data_sql = format!(
+                "{TRACK_BASE} AND t.item_id IN ({})
+                 GROUP BY t.item_id",
+                id_placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&data_sql)?;
+            let x = stmt.query_map(
+                rusqlite::params_from_iter(page_ids.iter()),
+                |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
+            )?.collect::<rusqlite::Result<_>>()?; x
+        };
 
         return Ok((total, tracks));
     }
@@ -423,11 +765,12 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
     values.push(Box::new(offset));
 
     let include_analysis = p.include_analysis();
+    let include_arrays = p.include_arrays();
     let include_clap = p.include_clap();
     let mut stmt = conn.prepare(&data_sql)?;
     let tracks: Vec<Track> = stmt.query_map(
         rusqlite::params_from_iter(values.iter()),
-        |row| parse_track_row(row, include_analysis, include_clap),
+        |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
     )?.collect::<rusqlite::Result<_>>()?;
 
     Ok((total, tracks))
@@ -439,7 +782,7 @@ pub fn get_track(conn: &Connection, id: i64, include_analysis: bool, include_cla
          GROUP BY t.item_id"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map(params![id], |row| parse_track_row(row, include_analysis, include_clap))?;
+    let mut rows = stmt.query_map(params![id], |row| parse_track_row(row, include_analysis, true, include_clap))?;
     Ok(rows.next().transpose()?)
 }
 
@@ -448,6 +791,68 @@ pub fn get_track_file_path(conn: &Connection, id: i64) -> Result<Option<String>>
                WHERE pm.item_id = ?1 AND pm.media_type='track' AND pm.provider_domain='filesystem_local'
                LIMIT 1";
     conn.query_row(sql, params![id], |r| r.get(0)).optional().map_err(Into::into)
+}
+
+/// Observatory bulk fetch: all tracks that have sonic_analysis, returning scalar fields only.
+/// Drives the join from audio_analysis aa_sonic (7K rows) not tracks (37K+) so the planner
+/// can use aa_sonic's implicit rowid ordering as the outer loop.  Returns every matching track
+/// in a single query — callers cache the result instead of paginating.
+pub fn observatory_tracks(conn: &Connection) -> Result<Vec<Track>> {
+    let sql = format!("
+SELECT
+  t.item_id,
+  t.name,
+  t.duration,
+  t.favorite,
+  t.timestamp_added,
+  t.timestamp_modified,
+  t.metadata,
+  GROUP_CONCAT(DISTINCT a.name) AS artists,
+  alb.name AS album,
+  alb.year,
+  alb.item_id AS album_id,
+  pm.provider_item_id AS file_path,
+  CAST(json_extract(aa_loud.analysis_data, '$.loudness_integrated') AS REAL) AS loudness_lufs,
+  CAST(json_extract(aa_loud.analysis_data, '$.loudness_album') AS REAL) AS loudness_album_lufs,
+  CAST(json_extract(aa_fades.analysis_data, '$.bpm') AS REAL) AS bpm,
+  json_extract(aa_fades.analysis_data, '$.key') AS fkey,
+  json_extract(aa_fades.analysis_data, '$.mode') AS fmode,
+  CAST(json_extract(aa_sonic.analysis_data, '$.energy') AS REAL) AS energy,
+  CAST(json_extract(aa_sonic.analysis_data, '$.valence') AS REAL) AS valence,
+  CAST(json_extract(aa_sonic.analysis_data, '$.danceability') AS REAL) AS danceability,
+  CAST(json_extract(aa_sonic.analysis_data, '$.arousal') AS REAL) AS arousal,
+  CAST(json_extract(aa_sonic.analysis_data, '$.acousticness') AS REAL) AS acousticness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.instrumentalness') AS REAL) AS instrumentalness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.brightness') AS REAL) AS brightness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.speechiness') AS REAL) AS speechiness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.roughness') AS REAL) AS roughness,
+  CAST(json_extract(aa_sonic.analysis_data, '$.harmonic_complexity') AS REAL) AS harmonic_complexity,
+  CAST(json_extract(aa_sonic.analysis_data, '$.rhythmic_regularity') AS REAL) AS rhythmic_regularity,
+  CAST(json_extract(aa_sonic.analysis_data, '$.spectral_centroid') AS REAL) AS spectral_centroid
+FROM audio_analysis aa_sonic
+JOIN provider_mappings pm
+  ON pm.provider_item_id = aa_sonic.item_id
+  AND pm.media_type = 'track'
+  AND pm.provider_domain = 'filesystem_local'
+JOIN tracks t ON t.item_id = pm.item_id
+LEFT JOIN track_artists ta ON ta.track_id = t.item_id
+LEFT JOIN artists a ON a.item_id = ta.artist_id
+LEFT JOIN album_tracks at2 ON at2.track_id = t.item_id
+LEFT JOIN albums alb ON alb.item_id = at2.album_id
+LEFT JOIN audio_analysis aa_loud
+  ON aa_loud.item_id = aa_sonic.item_id
+  AND aa_loud.aa_provider_domain = 'loudness_analysis'
+LEFT JOIN audio_analysis aa_fades
+  ON aa_fades.item_id = aa_sonic.item_id
+  AND aa_fades.aa_provider_domain = 'smart_fades'
+WHERE aa_sonic.aa_provider_domain = 'sonic_analysis'
+GROUP BY t.item_id
+ORDER BY t.item_id ASC
+");
+    let mut stmt = conn.prepare(&sql)?;
+    let tracks = stmt.query_map([], |row| parse_track_scalar_row(row))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(tracks)
 }
 
 pub fn all_clap_vectors(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
@@ -681,7 +1086,7 @@ pub fn search(conn: &Connection, q: &str, limit: i64) -> Result<SearchResults> {
     );
     let mut stmt = conn.prepare(&track_sql)?;
     let tracks: Vec<Track> = stmt.query_map(params![pattern, limit], |row| {
-        parse_track_row(row, false, false)
+        parse_track_row(row, false, false, false)
     })?.collect::<rusqlite::Result<_>>()?;
 
     let album_sql = "SELECT alb.item_id, alb.name,

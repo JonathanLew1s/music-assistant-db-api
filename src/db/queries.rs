@@ -241,8 +241,18 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
             values.push(Box::new($val));
         };
     }
-    if let Some(v) = p.bpm_min { sonic_filter!("bpm", ">=", v); }
-    if let Some(v) = p.bpm_max { sonic_filter!("bpm", "<=", v); }
+    macro_rules! fades_filter {
+        ($field:expr, $op:expr, $val:expr) => {
+            wheres.push(format!(
+                "CAST(json_extract(aa_fades.analysis_data, '$.{}') AS REAL) {} ?{}",
+                $field, $op, values.len() + 1
+            ));
+            values.push(Box::new($val));
+        };
+    }
+    // BPM lives in smart_fades (sonic_analysis.bpm is always null)
+    if let Some(v) = p.bpm_min { fades_filter!("bpm", ">=", v); }
+    if let Some(v) = p.bpm_max { fades_filter!("bpm", "<=", v); }
     if let Some(v) = p.energy_min { sonic_filter!("energy", ">=", v); }
     if let Some(v) = p.energy_max { sonic_filter!("energy", "<=", v); }
     if let Some(v) = p.valence_min { sonic_filter!("valence", ">=", v); }
@@ -279,6 +289,7 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
          LEFT JOIN album_tracks at2 ON at2.track_id = t.item_id
          LEFT JOIN provider_mappings pm ON pm.item_id = t.item_id AND pm.media_type='track' AND pm.provider_domain='filesystem_local'
          LEFT JOIN audio_analysis aa_sonic ON aa_sonic.item_id = pm.provider_item_id AND aa_sonic.aa_provider_domain='sonic_analysis'
+         LEFT JOIN audio_analysis aa_fades ON aa_fades.item_id = pm.provider_item_id AND aa_fades.aa_provider_domain='smart_fades'
          WHERE {where_clause}"
     );
     let total: i64 = conn.query_row(&count_sql, rusqlite::params_from_iter(values.iter()), |r| r.get(0))?;

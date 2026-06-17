@@ -1,0 +1,78 @@
+---
+# Strategic merge patch — add ma-db-api sidecar to the music-assistant deployment.
+# Apply with:
+#   kubectl patch deployment music-assistant -n music-assistant \
+#     --patch-file k8s/sidecar-patch.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: music-assistant
+  namespace: music-assistant
+spec:
+  template:
+    spec:
+      containers:
+        - name: ma-db-api
+          image: ghcr.io/jonathanlew1s/music-assistant-db-api:latest
+          imagePullPolicy: Always
+          env:
+            - name: MA_DB_PATH
+              value: /data/library.db
+            - name: MA_MUSIC_ROOT
+              value: /music
+            - name: PORT
+              value: "8097"
+            # Optional: uncomment and set MA_BRIDGE_API_KEY via a Secret
+            # - name: MA_BRIDGE_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: ma-bridge-secret
+            #       key: api-key
+          ports:
+            - name: api
+              containerPort: 8097
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+            - name: music
+              mountPath: /music
+              readOnly: true
+---
+# Dedicated ClusterIP service for the bridge (doesn't touch the existing MA service).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ma-db-api
+  namespace: music-assistant
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: music-assistant
+  ports:
+    - name: api
+      port: 8097
+      targetPort: 8097
+      protocol: TCP

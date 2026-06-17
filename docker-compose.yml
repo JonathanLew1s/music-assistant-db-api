@@ -1,0 +1,27 @@
+services:
+  ma-db-api:
+    image: ghcr.io/jonathanlew1s/music-assistant-db-api:latest
+    build: .
+    environment:
+      MA_DB_PATH: /data/library.db
+      MA_MUSIC_ROOT: /music
+      PORT: "8097"
+      MA_BRIDGE_API_KEY: ${MA_BRIDGE_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ma-data:/data:ro
+      - music:/music:ro
+    ports:
+      - "${MA_BRIDGE_PORT:-8097}:8097"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8097/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ma-data:
+    external: true
+  music:
+    external: true

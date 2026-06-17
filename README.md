@@ -46,8 +46,19 @@ All endpoints are under `/api/v1`. Paginated endpoints return:
 
 ### `GET /api/v1/health`
 
+Lightweight — no DB query. Used by k8s liveness/readiness/startup probes.
+
 ```bash
 curl http://localhost:8096/api/v1/health
+# {"status":"ok"}
+```
+
+### `GET /api/v1/health/detailed`
+
+Full stats — DB query, not in the probe path.
+
+```bash
+curl http://localhost:8096/api/v1/health/detailed
 ```
 
 ```json

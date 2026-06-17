@@ -51,7 +51,8 @@ async fn main() -> anyhow::Result<()> {
     let album_cover_state = (pool.clone(), music_root.clone(), cover_cache.clone());
 
     let api = Router::new()
-        .route("/health", get(routes::health::health).with_state(pool.clone()))
+        .route("/health", get(routes::health::health))
+        .route("/health/detailed", get(routes::health::health_detailed).with_state(pool.clone()))
         .route("/tracks", get(routes::tracks::list_tracks).with_state(pool.clone()))
         .route("/tracks/:id", get(routes::tracks::get_track).with_state(pool.clone()))
         .route("/tracks/:id/similar",

@@ -1,11 +1,15 @@
 use std::sync::Arc;
 use parking_lot::RwLock;
 
+type VectorStore = Arc<RwLock<Vec<(i64, Vec<f32>)>>>;
+
 pub struct SimilarityIndex {
-    vectors: Arc<RwLock<Vec<(i64, Vec<f32>)>>>,
+    vectors: VectorStore,
 }
 
 impl SimilarityIndex {
+    // Used in tests; not called in production startup (use empty() + reload()).
+    #[allow(dead_code)]
     pub fn new(vectors: Vec<(i64, Vec<f32>)>) -> Self {
         tracing::info!("similarity index loaded: {} vectors", vectors.len());
         Self { vectors: Arc::new(RwLock::new(vectors)) }
@@ -13,10 +17,6 @@ impl SimilarityIndex {
 
     pub fn empty() -> Self {
         Self { vectors: Arc::new(RwLock::new(vec![])) }
-    }
-
-    pub fn len(&self) -> usize {
-        self.vectors.read().len()
     }
 
     pub fn reload(&self, vectors: Vec<(i64, Vec<f32>)>) {
@@ -38,10 +38,7 @@ impl SimilarityIndex {
         let mut scores: Vec<(i64, f32)> = vecs
             .iter()
             .filter(|(id, _)| *id != query_id && !exclude_ids.contains(id))
-            .map(|(id, v)| {
-                let score = cosine_similarity(query_vec, v, query_norm);
-                (*id, score)
-            })
+            .map(|(id, v)| (*id, cosine_similarity(query_vec, v, query_norm)))
             .collect();
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

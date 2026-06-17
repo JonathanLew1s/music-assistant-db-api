@@ -7,9 +7,9 @@ use crate::{db::queries, error::AppError, models::{Artist, Page, track::{Track, 
 #[derive(Deserialize)]
 pub struct Paged {
     #[serde(default)] pub offset: i64,
-    #[serde(default = "dl")] pub limit: i64,
+    #[serde(default = "default_limit")] pub limit: i64,
 }
-fn dl() -> i64 { 100 }
+fn default_limit() -> i64 { 100 }
 
 pub async fn list_artists(
     State(pool): State<Pool>,

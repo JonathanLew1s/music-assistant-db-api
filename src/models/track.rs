@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct TrackAnalysis {
     pub loudness_lufs: Option<f64>,
     pub loudness_album_lufs: Option<f64>,

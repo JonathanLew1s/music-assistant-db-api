@@ -7,13 +7,13 @@ use crate::{db::queries, error::AppError, models::{Album, Page, track::{Track, T
 #[derive(Deserialize)]
 pub struct AlbumParams {
     #[serde(default)] pub offset: i64,
-    #[serde(default = "dl")] pub limit: i64,
+    #[serde(default = "default_limit")] pub limit: i64,
     pub since: Option<i64>,
     pub order: Option<String>,
     pub dir: Option<String>,
     pub artist_id: Option<i64>,
 }
-fn dl() -> i64 { 100 }
+fn default_limit() -> i64 { 100 }
 
 pub async fn list_albums(
     State(pool): State<Pool>,

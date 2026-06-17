@@ -6,6 +6,6 @@ pub mod track;
 
 pub use album::Album;
 pub use artist::Artist;
-pub use pagination::{Page, PaginationParams};
+pub use pagination::Page;
 pub use playlist::Playlist;
-pub use track::{Track, TrackAnalysis, TrackQueryParams};
+pub use track::Track;

@@ -60,7 +60,7 @@ pub async fn album_cover(
     Ok(build_cover_response(&result))
 }
 
-fn extract_cover(path: &PathBuf) -> Option<(Bytes, String)> {
+fn extract_cover(path: &std::path::Path) -> Option<(Bytes, String)> {
     let tagged = Probe::open(path)
         .ok()?
         .options(ParseOptions::new().read_properties(false))

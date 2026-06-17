@@ -14,13 +14,13 @@ The service runs as a **sidecar container** in the Music Assistant pod. Both con
 │                                                     │
 │  ┌──────────────────┐    ┌───────────────────────┐  │
 │  │  music-assistant │    │     ma-db-api          │  │
-│  │  :8095           │    │     :8097              │  │
+│  │  :8095           │    │     :8096              │  │
 │  └──────────────────┘    └───────────────────────┘  │
 │                \                   /                │
 │              /data/library.db  /music/              │
 │                (Longhorn RWO PVC)                   │
 └─────────────────────────────────────────────────────┘
-         ↕ ClusterIP service: ma-db-api:8097
+         ↕ ClusterIP service: ma-db-api:8096
 ```
 
 The sidecar pattern avoids the ReadWriteOnce constraint on the Longhorn PVC — both containers share the pod-level volume attachment without needing RWX storage.
@@ -31,7 +31,7 @@ The sidecar pattern avoids the ReadWriteOnce constraint on the Longhorn PVC — 
 |---|---|---|---|
 | `MA_DB_PATH` | yes | — | Absolute path to `library.db` (e.g. `/data/library.db`) |
 | `MA_MUSIC_ROOT` | yes | — | Absolute path to the music library root (e.g. `/music`) |
-| `PORT` | no | `8097` | Port to listen on |
+| `PORT` | no | `8096` | Port to listen on |
 | `MA_BRIDGE_API_KEY` | no | — | If set, all requests require `Authorization: Bearer <key>` |
 | `DB_POOL_SIZE` | no | `4` | SQLite connection pool size |
 | `LOG_LEVEL` | no | `info` | `tracing` filter, e.g. `debug`, `info,tower_http=warn` |
@@ -47,7 +47,7 @@ All endpoints are under `/api/v1`. Paginated endpoints return:
 ### `GET /api/v1/health`
 
 ```bash
-curl http://localhost:8097/api/v1/health
+curl http://localhost:8096/api/v1/health
 ```
 
 ```json
@@ -89,7 +89,7 @@ List tracks with optional filtering.
 
 ```bash
 # High-energy tracks modified in the last week, with analysis
-curl "http://localhost:8097/api/v1/tracks?energy_min=0.7&since=1749600000&include=analysis&limit=20"
+curl "http://localhost:8096/api/v1/tracks?energy_min=0.7&since=1749600000&include=analysis&limit=20"
 ```
 
 Track object:
@@ -150,7 +150,7 @@ With `?include=analysis,clap`, `clap_embedding` becomes a 1024-element float arr
 Single track. Same `?include` parameter as the list endpoint.
 
 ```bash
-curl "http://localhost:8097/api/v1/tracks/12345?include=analysis"
+curl "http://localhost:8096/api/v1/tracks/12345?include=analysis"
 ```
 
 ---
@@ -165,7 +165,7 @@ Find acoustically similar tracks using cosine similarity over CLAP embeddings. R
 | `exclude` | comma-separated IDs | Exclude these track IDs from results |
 
 ```bash
-curl "http://localhost:8097/api/v1/tracks/12345/similar?limit=5&exclude=12345,99001"
+curl "http://localhost:8096/api/v1/tracks/12345/similar?limit=5&exclude=12345,99001"
 ```
 
 ```json
@@ -185,7 +185,7 @@ curl "http://localhost:8097/api/v1/tracks/12345/similar?limit=5&exclude=12345,99
 Embedded cover art extracted from the audio file. Returns `image/jpeg` or `image/png`. Responds 404 if no embedded art is found.
 
 ```bash
-curl -o cover.jpg http://localhost:8097/api/v1/tracks/12345/cover
+curl -o cover.jpg http://localhost:8096/api/v1/tracks/12345/cover
 ```
 
 ---
@@ -262,7 +262,7 @@ kubectl patch deployment music-assistant -n music-assistant \
   --patch-file k8s/sidecar-patch.yaml
 ```
 
-The patch also creates a `ClusterIP` service (`ma-db-api.music-assistant:8097`) so other pods in the cluster can reach the bridge without going through a host port.
+The patch also creates a `ClusterIP` service (`ma-db-api.music-assistant:8096`) so other pods in the cluster can reach the bridge without going through a host port.
 
 To rotate or add an API key:
 

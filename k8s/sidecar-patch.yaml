@@ -21,7 +21,7 @@ spec:
             - name: MA_MUSIC_ROOT
               value: /music
             - name: PORT
-              value: "8097"
+              value: "8096"
             # Optional: uncomment and set MA_BRIDGE_API_KEY via a Secret
             # - name: MA_BRIDGE_API_KEY
             #   valueFrom:
@@ -30,7 +30,7 @@ spec:
             #       key: api-key
           ports:
             - name: api
-              containerPort: 8097
+              containerPort: 8096
               protocol: TCP
           readinessProbe:
             httpGet:
@@ -73,6 +73,6 @@ spec:
     app.kubernetes.io/name: music-assistant
   ports:
     - name: api
-      port: 8097
-      targetPort: 8097
+      port: 8096
+      targetPort: 8096
       protocol: TCP

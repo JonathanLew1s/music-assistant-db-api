@@ -9,5 +9,5 @@ RUN touch src/main.rs && cargo build --release
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/target/release/ma-db-api /usr/local/bin/ma-db-api
-EXPOSE 8097
+EXPOSE 8096
 ENTRYPOINT ["/usr/local/bin/ma-db-api"]

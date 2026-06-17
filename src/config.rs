@@ -16,7 +16,7 @@ impl Config {
         let music_root = env::var("MA_MUSIC_ROOT")
             .map_err(|_| anyhow::anyhow!("MA_MUSIC_ROOT is required"))?;
         let port = env::var("PORT")
-            .unwrap_or_else(|_| "8097".into())
+            .unwrap_or_else(|_| "8096".into())
             .parse::<u16>()?;
         let api_key = env::var("MA_BRIDGE_API_KEY").ok().filter(|s| !s.is_empty());
         let pool_size = env::var("DB_POOL_SIZE")

@@ -67,7 +67,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/artists/:id", get(routes::artists::get_artist).with_state(pool.clone()))
         .route("/artists/:id/tracks", get(routes::artists::artist_tracks).with_state(pool.clone()))
         .route("/playlists", get(routes::playlists::list_playlists).with_state(pool.clone()))
-        .route("/playlists/:id/tracks", get(routes::playlists::playlist_tracks).with_state(pool.clone()))
         .route("/search", get(routes::search::search).with_state(pool.clone()));
 
     let api = if let Some(key) = cfg.api_key.clone() {

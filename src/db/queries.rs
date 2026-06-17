@@ -520,29 +520,18 @@ pub fn get_artist(conn: &Connection, id: i64) -> Result<Option<Artist>> {
 
 pub fn list_playlists(conn: &Connection, offset: i64, limit: i64) -> Result<(i64, Vec<Playlist>)> {
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM playlists", [], |r| r.get(0))?;
-    let sql = "SELECT p.item_id, p.name,
-               (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.item_id) AS track_count,
-               p.timestamp_modified
+    // MA playlist tracks are resolved dynamically at runtime — no junction table exists in the DB.
+    let sql = "SELECT p.item_id, p.name, p.timestamp_modified
                FROM playlists p ORDER BY p.name ASC LIMIT ?1 OFFSET ?2";
     let mut stmt = conn.prepare(sql)?;
     let playlists: Vec<Playlist> = stmt.query_map(params![limit, offset], |row| {
         Ok(Playlist {
             id: row.get(0)?,
             name: row.get(1)?,
-            track_count: row.get(2)?,
-            timestamp_modified: row.get(3)?,
+            timestamp_modified: row.get(2)?,
         })
     })?.collect::<rusqlite::Result<_>>()?;
     Ok((total, playlists))
-}
-
-pub fn get_playlist_track_ids(conn: &Connection, playlist_id: i64) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT pt.track_id FROM playlist_tracks pt WHERE pt.playlist_id = ?1 ORDER BY pt.position ASC"
-    )?;
-    let ids: Vec<i64> = stmt.query_map(params![playlist_id], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(ids)
 }
 
 // ---------------------------------------------------------------------------

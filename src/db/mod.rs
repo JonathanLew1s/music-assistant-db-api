@@ -5,7 +5,12 @@ use anyhow::Context;
 pub mod queries;
 
 pub async fn build_pool(db_path: &str, pool_size: usize) -> anyhow::Result<Pool> {
-    let cfg = PoolConfig::new(db_path);
+    // immutable=1 bypasses all SQLite file locking. MA holds the db with an
+    // exclusive lock; without this flag even a read-only open returns SQLITE_BUSY.
+    // Safe here because we never write. rusqlite's default OpenFlags include
+    // SQLITE_OPEN_URI so the file: URI is interpreted correctly.
+    let uri = format!("file:{}?immutable=1", db_path);
+    let cfg = PoolConfig::new(uri);
     let pool = cfg.builder(Runtime::Tokio1)?
         .max_size(pool_size)
         .build()?;
@@ -19,11 +24,8 @@ pub async fn build_pool(db_path: &str, pool_size: usize) -> anyhow::Result<Pool>
 }
 
 pub fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
-    // Don't set journal_mode — MA owns that; setting it requires a write lock
-    // and triggers SQLITE_BUSY. In WAL mode concurrent readers work without it.
     conn.execute_batch("
         PRAGMA query_only=ON;
-        PRAGMA busy_timeout=5000;
         PRAGMA temp_store=MEMORY;
         PRAGMA cache_size=-8000;
     ")?;

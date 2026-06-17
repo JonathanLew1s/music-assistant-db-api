@@ -237,6 +237,11 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         values.push(Box::new(album_id));
     }
 
+    let has_audio_filters = p.bpm_min.is_some() || p.bpm_max.is_some()
+        || p.energy_min.is_some() || p.energy_max.is_some()
+        || p.valence_min.is_some() || p.valence_max.is_some()
+        || p.arousal_min.is_some() || p.arousal_max.is_some();
+
     macro_rules! sonic_filter {
         ($field:expr, $op:expr, $val:expr) => {
             wheres.push(format!(
@@ -276,6 +281,7 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         }
     }
 
+    let is_random = p.order.as_deref() == Some("random");
     let order_col = match p.order.as_deref().unwrap_or("name") {
         "timestamp_added" => "t.timestamp_added",
         "timestamp_modified" => "t.timestamp_modified",
@@ -286,6 +292,112 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
     let where_clause = wheres.join(" AND ");
     let limit = p.clamped_limit();
     let offset = p.offset;
+
+    // Fast path: random order without audio filters.
+    // ORDER BY RANDOM() on the full 5-way join (including 3 audio_analysis tables) across
+    // 37K+ rows takes ~9s. Instead: sample item_ids from provider_mappings (indexed, no
+    // large JSON columns) then fetch full rows for only those N ids.
+    if is_random && !has_audio_filters {
+        // Stage 1: randomly sample item_ids from the lightweight provider_mappings join.
+        // provider_mappings has an index on (media_type, provider_domain) so this is fast.
+        // Build lightweight where clauses that don't need audio_analysis joins.
+        let mut pm_wheres: Vec<String> = vec![
+            "pm.media_type='track'".into(),
+            "pm.provider_domain='filesystem_local'".into(),
+        ];
+        let mut pm_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        if let Some(since) = p.since {
+            pm_wheres.push(format!("t.timestamp_modified > ?{}", pm_values.len() + 1));
+            pm_values.push(Box::new(since));
+        }
+        if let Some(fav) = p.favorite {
+            pm_wheres.push(format!("t.favorite = ?{}", pm_values.len() + 1));
+            pm_values.push(Box::new(fav as i64));
+        }
+        if let Some(ref genre) = p.genre {
+            pm_wheres.push(format!(
+                "json_extract(t.metadata, '$.genres[0]') = ?{}",
+                pm_values.len() + 1
+            ));
+            pm_values.push(Box::new(genre.clone()));
+        }
+        if let Some(artist_id) = p.artist_id {
+            pm_wheres.push(format!(
+                "EXISTS (SELECT 1 FROM track_artists ta2 WHERE ta2.track_id = t.item_id AND ta2.artist_id = ?{})",
+                pm_values.len() + 1
+            ));
+            pm_values.push(Box::new(artist_id));
+        }
+        if let Some(album_id) = p.album_id {
+            pm_wheres.push(format!(
+                "EXISTS (SELECT 1 FROM album_tracks at3 WHERE at3.track_id = t.item_id AND at3.album_id = ?{})",
+                pm_values.len() + 1
+            ));
+            pm_values.push(Box::new(album_id));
+        }
+        if !exclude_ids.is_empty() {
+            let placeholders: Vec<String> = (0..exclude_ids.len())
+                .map(|i| format!("?{}", pm_values.len() + i + 1))
+                .collect();
+            pm_wheres.push(format!("t.item_id NOT IN ({})", placeholders.join(",")));
+            for id in &exclude_ids {
+                pm_values.push(Box::new(*id));
+            }
+        }
+        let pm_where = pm_wheres.join(" AND ");
+
+        // Lightweight count — same join, no audio_analysis needed.
+        let count_sql = format!(
+            "SELECT COUNT(DISTINCT t.item_id)
+             FROM tracks t
+             JOIN provider_mappings pm ON pm.item_id = t.item_id
+             WHERE {pm_where}"
+        );
+        let total: i64 = conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(pm_values.iter()),
+            |r| r.get(0),
+        )?;
+
+        pm_values.push(Box::new(limit));
+        let id_sql = format!(
+            "SELECT pm.item_id FROM provider_mappings pm
+             JOIN tracks t ON t.item_id = pm.item_id
+             WHERE {pm_where}
+             ORDER BY RANDOM()
+             LIMIT ?{}",
+            pm_values.len()
+        );
+        let mut id_stmt = conn.prepare(&id_sql)?;
+        let sampled_ids: Vec<i64> = id_stmt.query_map(
+            rusqlite::params_from_iter(pm_values.iter()),
+            |row| row.get(0),
+        )?.collect::<rusqlite::Result<_>>()?;
+
+        if sampled_ids.is_empty() {
+            return Ok((total, vec![]));
+        }
+
+        // Stage 2: fetch full joined rows for the sampled ids only.
+        let id_placeholders: Vec<String> = (1..=sampled_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect();
+        let data_sql = format!(
+            "{TRACK_BASE} AND t.item_id IN ({})
+             GROUP BY t.item_id",
+            id_placeholders.join(",")
+        );
+        let include_analysis = p.include_analysis();
+        let include_clap = p.include_clap();
+        let mut stmt = conn.prepare(&data_sql)?;
+        let tracks: Vec<Track> = stmt.query_map(
+            rusqlite::params_from_iter(sampled_ids.iter()),
+            |row| parse_track_row(row, include_analysis, include_clap),
+        )?.collect::<rusqlite::Result<_>>()?;
+
+        return Ok((total, tracks));
+    }
 
     let count_sql = format!(
         "SELECT COUNT(DISTINCT t.item_id)

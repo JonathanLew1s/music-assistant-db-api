@@ -27,7 +27,8 @@ pub fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch("
         PRAGMA query_only=ON;
         PRAGMA temp_store=MEMORY;
-        PRAGMA cache_size=-8000;
+        PRAGMA cache_size=-32000;
+        PRAGMA mmap_size=268435456;
     ")?;
     Ok(())
 }

@@ -56,9 +56,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(routes::health::health))
         .route("/health/detailed", get(routes::health::health_detailed).with_state(pool.clone()))
         .route("/tracks", get(routes::tracks::list_tracks).with_state(pool.clone()))
-        .route("/tracks/observatory",
-            get(routes::tracks::observatory_tracks)
-                .with_state((pool.clone(), observatory_cache)))
+        .route("/tracks/observatory", get(routes::tracks::observatory_tracks).with_state(pool.clone()))
         .route("/tracks/:id", get(routes::tracks::get_track).with_state(pool.clone()))
         .route("/tracks/:id/similar",
             get(routes::similar::similar_tracks)
@@ -73,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/artists/:id/tracks", get(routes::artists::artist_tracks).with_state(pool.clone()))
         .route("/playlists", get(routes::playlists::list_playlists).with_state(pool.clone()))
         .route("/search", get(routes::search::search).with_state(pool.clone()));
+
+    let api = api.layer(axum::Extension(observatory_cache));
 
     let api = if let Some(key) = cfg.api_key.clone() {
         api.layer(middleware::from_fn(move |req, next| {

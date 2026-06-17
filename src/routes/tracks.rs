@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 use deadpool_sqlite::Pool;
 use parking_lot::Mutex;
@@ -27,8 +27,12 @@ pub struct ObservatoryPage {
 /// Returns all tracks that have sonic_analysis, optimised for the observatory bulk fetch.
 /// Drives the JOIN from audio_analysis (7K rows) rather than tracks (37K+), and caches
 /// the full result for OBSERVATORY_TTL so repeated page-loads are instant.
+/// Uses Extension (not State) for the cache so this handler shares the Pool state type
+/// with all other track handlers — avoiding Axum route-priority issues with static vs
+/// parameterised paths.
 pub async fn observatory_tracks(
-    State((pool, cache)): State<(Pool, ObservatoryCache)>,
+    State(pool): State<Pool>,
+    Extension(cache): Extension<ObservatoryCache>,
 ) -> Result<Json<ObservatoryPage>, AppError> {
     // Serve from cache if still fresh.
     {

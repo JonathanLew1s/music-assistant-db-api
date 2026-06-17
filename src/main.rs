@@ -47,6 +47,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let observatory_cache = ObservatoryCache::new();
+    // Pre-warm the observatory cache on startup so the first user request is instant.
+    {
+        let pool2 = pool.clone();
+        let obs_cache = observatory_cache.clone();
+        tokio::spawn(async move {
+            match pool2.get().await {
+                Ok(conn) => {
+                    match conn.interact(|c| db::queries::observatory_tracks(c)).await {
+                        Ok(Ok(tracks)) => {
+                            let total = tracks.len();
+                            *obs_cache.0.lock() = Some((std::time::Instant::now(), tracks));
+                            tracing::info!("observatory cache pre-warmed: {} tracks", total);
+                        }
+                        Ok(Err(e)) => tracing::warn!("observatory pre-warm query error: {e}"),
+                        Err(e) => tracing::warn!("observatory pre-warm pool error: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("observatory pre-warm pool get error: {e}"),
+            }
+        });
+    }
     let cover_cache = new_cover_cache();
     let music_root = cfg.music_root.clone();
     let track_cover_state = (pool.clone(), music_root.clone(), cover_cache.clone());

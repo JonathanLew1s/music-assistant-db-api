@@ -798,6 +798,9 @@ pub fn get_track_file_path(conn: &Connection, id: i64) -> Result<Option<String>>
 /// can use aa_sonic's implicit rowid ordering as the outer loop.  Returns every matching track
 /// in a single query — callers cache the result instead of paginating.
 pub fn observatory_tracks(conn: &Connection) -> Result<Vec<Track>> {
+    // Single LEFT JOIN with conditional aggregation instead of two separate
+    // audio_analysis LEFT JOINs — halves the number of full-table scans on the
+    // 93K-row unindexed audio_analysis table (read-only mount, can't add indexes).
     let sql = format!("
 SELECT
   t.item_id,
@@ -812,11 +815,16 @@ SELECT
   alb.year,
   alb.item_id AS album_id,
   pm.provider_item_id AS file_path,
-  CAST(json_extract(aa_loud.analysis_data, '$.loudness_integrated') AS REAL) AS loudness_lufs,
-  CAST(json_extract(aa_loud.analysis_data, '$.loudness_album') AS REAL) AS loudness_album_lufs,
-  CAST(json_extract(aa_fades.analysis_data, '$.bpm') AS REAL) AS bpm,
-  json_extract(aa_fades.analysis_data, '$.key') AS fkey,
-  json_extract(aa_fades.analysis_data, '$.mode') AS fmode,
+  MAX(CASE WHEN aa_extra.aa_provider_domain='loudness_analysis'
+      THEN CAST(json_extract(aa_extra.analysis_data, '$.loudness_integrated') AS REAL) END) AS loudness_lufs,
+  MAX(CASE WHEN aa_extra.aa_provider_domain='loudness_analysis'
+      THEN CAST(json_extract(aa_extra.analysis_data, '$.loudness_album') AS REAL) END) AS loudness_album_lufs,
+  MAX(CASE WHEN aa_extra.aa_provider_domain='smart_fades'
+      THEN CAST(json_extract(aa_extra.analysis_data, '$.bpm') AS REAL) END) AS bpm,
+  MAX(CASE WHEN aa_extra.aa_provider_domain='smart_fades'
+      THEN json_extract(aa_extra.analysis_data, '$.key') END) AS fkey,
+  MAX(CASE WHEN aa_extra.aa_provider_domain='smart_fades'
+      THEN json_extract(aa_extra.analysis_data, '$.mode') END) AS fmode,
   CAST(json_extract(aa_sonic.analysis_data, '$.energy') AS REAL) AS energy,
   CAST(json_extract(aa_sonic.analysis_data, '$.valence') AS REAL) AS valence,
   CAST(json_extract(aa_sonic.analysis_data, '$.danceability') AS REAL) AS danceability,
@@ -839,12 +847,9 @@ LEFT JOIN track_artists ta ON ta.track_id = t.item_id
 LEFT JOIN artists a ON a.item_id = ta.artist_id
 LEFT JOIN album_tracks at2 ON at2.track_id = t.item_id
 LEFT JOIN albums alb ON alb.item_id = at2.album_id
-LEFT JOIN audio_analysis aa_loud
-  ON aa_loud.item_id = aa_sonic.item_id
-  AND aa_loud.aa_provider_domain = 'loudness_analysis'
-LEFT JOIN audio_analysis aa_fades
-  ON aa_fades.item_id = aa_sonic.item_id
-  AND aa_fades.aa_provider_domain = 'smart_fades'
+LEFT JOIN audio_analysis aa_extra
+  ON aa_extra.item_id = aa_sonic.item_id
+  AND aa_extra.aa_provider_domain IN ('loudness_analysis', 'smart_fades')
 WHERE aa_sonic.aa_provider_domain = 'sonic_analysis'
 GROUP BY t.item_id
 ORDER BY t.item_id ASC

@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use crate::{db::queries, error::AppError, models::{Page, track::{Track, TrackQueryParams}}};
 
-const OBSERVATORY_TTL: Duration = Duration::from_secs(300);
+const OBSERVATORY_TTL: Duration = Duration::from_secs(1800);
 
 #[derive(Clone)]
 pub struct ObservatoryCache(pub Arc<Mutex<Option<(Instant, Vec<Track>)>>>);

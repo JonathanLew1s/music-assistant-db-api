@@ -75,9 +75,25 @@ pub struct TrackQueryParams {
 fn default_limit() -> i64 { 100 }
 
 impl TrackQueryParams {
-    pub fn clamped_limit(&self) -> i64 { self.limit.clamp(1, 1000) }
+    pub fn clamped_limit(&self) -> i64 {
+        // Scalar-only responses omit large arrays (~40x smaller payload);
+        // allow higher limits so callers can fetch more rows per page.
+        let max = if self.include.as_deref().map(|s| s.contains("scalar")).unwrap_or(false) {
+            10_000
+        } else {
+            1_000
+        };
+        self.limit.clamp(1, max)
+    }
     pub fn include_analysis(&self) -> bool {
         self.include.as_deref().map(|s| s.contains("analysis")).unwrap_or(false)
+    }
+    /// True only for full analysis — arrays (beats, rms_energy) included.
+    /// `analysis_scalar` includes analysis but omits the array fields for smaller payloads.
+    pub fn include_arrays(&self) -> bool {
+        self.include.as_deref()
+            .map(|s| s.contains("analysis") && !s.contains("scalar"))
+            .unwrap_or(false)
     }
     pub fn include_clap(&self) -> bool {
         self.include.as_deref().map(|s| s.contains("clap")).unwrap_or(false)

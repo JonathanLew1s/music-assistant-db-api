@@ -1,11 +1,22 @@
-use axum::{extract::State, Json};
+use axum::{extract::State, Json, http::StatusCode, response::IntoResponse};
 use serde_json::{json, Value};
 use deadpool_sqlite::Pool;
 use crate::{db::queries, error::AppError};
 
-// Lightweight — no DB query. Used by k8s liveness/readiness/startup probes.
-pub async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+// Liveness probe — runs a trivial DB query so k8s detects corruption/lock and
+// restarts the container automatically. Returns 500 on any DB error.
+pub async fn health(State(pool): State<Pool>) -> impl IntoResponse {
+    let result: Result<(), anyhow::Error> = async {
+        let conn = pool.get().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        conn.interact(|c| c.execute_batch("SELECT 1")).await
+            .map_err(|e| anyhow::anyhow!("{e}"))??;
+        Ok(())
+    }.await;
+
+    match result {
+        Ok(_) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "status": "error", "error": e.to_string() }))).into_response(),
+    }
 }
 
 // Full stats — used for operational visibility. Not in the probe path.

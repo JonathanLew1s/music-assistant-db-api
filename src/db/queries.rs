@@ -579,6 +579,176 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         return Ok((total, tracks));
     }
 
+    // Fast path: random order with sonic filters only (energy / valence / arousal, no BPM).
+    // ORDER BY RANDOM() on the full 5-way join takes ~17s for 5K+ matching rows.
+    // Instead: scan the small sonic_analysis table (~7K rows) which already holds the
+    // analysis_data we need for filtering, sample item_ids there, then fetch full rows
+    // for only those N ids — same two-stage idea as the no-filter random fast path.
+    let has_bpm_filters = p.bpm_min.is_some() || p.bpm_max.is_some();
+    let has_sonic_only_filters = has_audio_filters && !has_bpm_filters;
+
+    if is_random && has_sonic_only_filters {
+        let mut aa_wheres: Vec<String> = vec![
+            "aa.aa_provider_domain = 'sonic_analysis'".into(),
+            "pm.media_type = 'track'".into(),
+            "pm.provider_domain = 'filesystem_local'".into(),
+        ];
+        let mut aa_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        // Energy / valence / arousal — all live in sonic_analysis.analysis_data
+        if let Some(v) = p.energy_min {
+            aa_wheres.push(format!(
+                "CAST(json_extract(aa.analysis_data, '$.energy') AS REAL) >= ?{}",
+                aa_values.len() + 1
+            ));
+            aa_values.push(Box::new(v));
+        }
+        if let Some(v) = p.energy_max {
+            aa_wheres.push(format!(
+                "CAST(json_extract(aa.analysis_data, '$.energy') AS REAL) <= ?{}",
+                aa_values.len() + 1
+            ));
+            aa_values.push(Box::new(v));
+        }
+        if let Some(v) = p.valence_min {
+            aa_wheres.push(format!(
+                "CAST(json_extract(aa.analysis_data, '$.valence') AS REAL) >= ?{}",
+                aa_values.len() + 1
+            ));
+            aa_values.push(Box::new(v));
+        }
+        if let Some(v) = p.valence_max {
+            aa_wheres.push(format!(
+                "CAST(json_extract(aa.analysis_data, '$.valence') AS REAL) <= ?{}",
+                aa_values.len() + 1
+            ));
+            aa_values.push(Box::new(v));
+        }
+        if let Some(v) = p.arousal_min {
+            aa_wheres.push(format!(
+                "CAST(json_extract(aa.analysis_data, '$.arousal') AS REAL) >= ?{}",
+                aa_values.len() + 1
+            ));
+            aa_values.push(Box::new(v));
+        }
+        if let Some(v) = p.arousal_max {
+            aa_wheres.push(format!(
+                "CAST(json_extract(aa.analysis_data, '$.arousal') AS REAL) <= ?{}",
+                aa_values.len() + 1
+            ));
+            aa_values.push(Box::new(v));
+        }
+
+        // Standard filters (since, favorite, genre, artist_id, album_id, exclude)
+        if let Some(since) = p.since {
+            aa_wheres.push(format!("t.timestamp_modified > ?{}", aa_values.len() + 1));
+            aa_values.push(Box::new(since));
+        }
+        if let Some(fav) = p.favorite {
+            aa_wheres.push(format!("t.favorite = ?{}", aa_values.len() + 1));
+            aa_values.push(Box::new(fav as i64));
+        }
+        if let Some(ref genre) = p.genre {
+            aa_wheres.push(format!(
+                "json_extract(t.metadata, '$.genres[0]') = ?{}",
+                aa_values.len() + 1
+            ));
+            aa_values.push(Box::new(genre.clone()));
+        }
+        if let Some(artist_id) = p.artist_id {
+            aa_wheres.push(format!(
+                "EXISTS (SELECT 1 FROM track_artists ta2 WHERE ta2.track_id = t.item_id AND ta2.artist_id = ?{})",
+                aa_values.len() + 1
+            ));
+            aa_values.push(Box::new(artist_id));
+        }
+        if let Some(album_id) = p.album_id {
+            aa_wheres.push(format!(
+                "EXISTS (SELECT 1 FROM album_tracks at3 WHERE at3.track_id = t.item_id AND at3.album_id = ?{})",
+                aa_values.len() + 1
+            ));
+            aa_values.push(Box::new(album_id));
+        }
+        if !exclude_ids.is_empty() {
+            let placeholders: Vec<String> = (0..exclude_ids.len())
+                .map(|i| format!("?{}", aa_values.len() + i + 1))
+                .collect();
+            aa_wheres.push(format!("t.item_id NOT IN ({})", placeholders.join(",")));
+            for id in &exclude_ids {
+                aa_values.push(Box::new(*id));
+            }
+        }
+        let aa_where = aa_wheres.join(" AND ");
+
+        let count_sql = format!(
+            "SELECT COUNT(DISTINCT pm.item_id)
+             FROM audio_analysis aa
+             JOIN provider_mappings pm ON pm.provider_item_id = aa.item_id
+             JOIN tracks t ON t.item_id = pm.item_id
+             WHERE {aa_where}"
+        );
+        let total: i64 = conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(aa_values.iter()),
+            |r| r.get(0),
+        )?;
+
+        aa_values.push(Box::new(limit));
+        let id_sql = format!(
+            "SELECT DISTINCT pm.item_id
+             FROM audio_analysis aa
+             JOIN provider_mappings pm ON pm.provider_item_id = aa.item_id
+             JOIN tracks t ON t.item_id = pm.item_id
+             WHERE {aa_where}
+             ORDER BY RANDOM()
+             LIMIT ?{}",
+            aa_values.len()
+        );
+        let mut id_stmt = conn.prepare(&id_sql)?;
+        let sampled_ids: Vec<i64> = id_stmt.query_map(
+            rusqlite::params_from_iter(aa_values.iter()),
+            |row| row.get(0),
+        )?.collect::<rusqlite::Result<_>>()?;
+
+        if sampled_ids.is_empty() {
+            return Ok((total, vec![]));
+        }
+
+        // Stage 2: fetch full joined rows for the sampled ids only.
+        let id_placeholders: Vec<String> = (1..=sampled_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect();
+        let include_analysis = p.include_analysis();
+        let include_arrays = p.include_arrays();
+        let include_clap = p.include_clap();
+
+        let tracks: Vec<Track> = if include_analysis && !include_arrays {
+            let data_sql = format!(
+                "{TRACK_BASE_SCALAR} AND t.item_id IN ({})
+                 GROUP BY t.item_id",
+                id_placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&data_sql)?;
+            let x = stmt.query_map(
+                rusqlite::params_from_iter(sampled_ids.iter()),
+                |row| parse_track_scalar_row(row),
+            )?.collect::<rusqlite::Result<_>>()?; x
+        } else {
+            let data_sql = format!(
+                "{TRACK_BASE} AND t.item_id IN ({})
+                 GROUP BY t.item_id",
+                id_placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&data_sql)?;
+            let x = stmt.query_map(
+                rusqlite::params_from_iter(sampled_ids.iter()),
+                |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
+            )?.collect::<rusqlite::Result<_>>()?; x
+        };
+
+        return Ok((total, tracks));
+    }
+
     // Two-stage pagination fast path: use lightweight provider_mappings enumeration
     // then fetch full rows only for the page's IDs. Same idea as the random fast path
     // but with deterministic LIMIT/OFFSET ordering instead of RANDOM().

@@ -8,7 +8,7 @@ use crate::{db::queries, error::AppError};
 pub async fn health(State(pool): State<Pool>) -> impl IntoResponse {
     let result: Result<(), anyhow::Error> = async {
         let conn = pool.get().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        conn.interact(|c| c.execute_batch("SELECT 1")).await
+        conn.interact(|c| c.execute_batch("SELECT COUNT(*) FROM tracks")).await
             .map_err(|e| anyhow::anyhow!("{e}"))??;
         Ok(())
     }.await;

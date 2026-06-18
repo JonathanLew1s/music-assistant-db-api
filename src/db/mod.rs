@@ -5,11 +5,12 @@ use anyhow::Context;
 pub mod queries;
 
 pub async fn build_pool(db_path: &str, pool_size: usize) -> anyhow::Result<Pool> {
-    // immutable=1 bypasses all SQLite file locking. MA holds the db with an
-    // exclusive lock; without this flag even a read-only open returns SQLITE_BUSY.
-    // Safe here because we never write. rusqlite's default OpenFlags include
-    // SQLITE_OPEN_URI so the file: URI is interpreted correctly.
-    let uri = format!("file:{}?immutable=1", db_path);
+    // mode=ro opens read-only without taking any file locks. SQLite in WAL mode
+    // uses an in-memory shm for read-only openers so the read-only volume mount
+    // is fine. Unlike immutable=1, pages are re-read from disk on each query so
+    // the sidecar always sees MA's latest writes rather than a stale snapshot
+    // that goes "malformed" after a WAL checkpoint.
+    let uri = format!("file:{}?mode=ro", db_path);
     let cfg = PoolConfig::new(uri);
     let pool = cfg.builder(Runtime::Tokio1)?
         .max_size(pool_size)

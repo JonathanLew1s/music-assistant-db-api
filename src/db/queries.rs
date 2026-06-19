@@ -566,7 +566,7 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         let tracks: Vec<Track> = if include_analysis && !include_arrays {
             let data_sql = format!(
                 "{TRACK_BASE_SCALAR} AND t.item_id IN ({})
-                 GROUP BY t.item_id",
+                 GROUP BY t.item_id ORDER BY RANDOM()",
                 id_placeholders.join(",")
             );
             let mut stmt = conn.prepare(&data_sql)?;
@@ -577,7 +577,7 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         } else {
             let data_sql = format!(
                 "{TRACK_BASE} AND t.item_id IN ({})
-                 GROUP BY t.item_id",
+                 GROUP BY t.item_id ORDER BY RANDOM()",
                 id_placeholders.join(",")
             );
             let mut stmt = conn.prepare(&data_sql)?;
@@ -736,7 +736,7 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         let tracks: Vec<Track> = if include_analysis && !include_arrays {
             let data_sql = format!(
                 "{TRACK_BASE_SCALAR} AND t.item_id IN ({})
-                 GROUP BY t.item_id",
+                 GROUP BY t.item_id ORDER BY RANDOM()",
                 id_placeholders.join(",")
             );
             let mut stmt = conn.prepare(&data_sql)?;
@@ -747,7 +747,7 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         } else {
             let data_sql = format!(
                 "{TRACK_BASE} AND t.item_id IN ({})
-                 GROUP BY t.item_id",
+                 GROUP BY t.item_id ORDER BY RANDOM()",
                 id_placeholders.join(",")
             );
             let mut stmt = conn.prepare(&data_sql)?;

@@ -38,6 +38,7 @@ pub struct Track {
     pub album_id: Option<i64>,
     pub year: Option<i64>,
     pub genre: Option<String>,
+    pub popularity: Option<f64>,
     pub duration: Option<f64>,
     pub file_path: Option<String>,
     pub favorite: Option<bool>,

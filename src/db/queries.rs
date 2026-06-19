@@ -187,6 +187,9 @@ pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
         .map(String::from);
+    let popularity = metadata.as_ref()
+        .and_then(|m| m.get("popularity"))
+        .and_then(|p| p.as_f64());
 
     let camelot = key.as_deref().zip(mode.as_deref())
         .and_then(|(k, m)| to_camelot(k, m));
@@ -231,6 +234,7 @@ pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
         album_id,
         year,
         genre,
+        popularity,
         duration,
         file_path,
         favorite,
@@ -274,6 +278,9 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
         .map(String::from);
+    let popularity = metadata.as_ref()
+        .and_then(|m| m.get("popularity"))
+        .and_then(|p| p.as_f64());
 
     let analysis = if include_analysis {
         let loud: Option<Value> = loudness_str.as_deref().and_then(|s| serde_json::from_str(s).ok());
@@ -354,6 +361,7 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
         album_id,
         year,
         genre,
+        popularity,
         duration,
         file_path,
         favorite,
@@ -1302,4 +1310,23 @@ pub fn search(conn: &Connection, q: &str, limit: i64) -> Result<SearchResults> {
     })?.collect::<rusqlite::Result<_>>()?;
 
     Ok(SearchResults { tracks, albums, artists })
+}
+
+#[cfg(test)]
+mod popularity_tests {
+    use serde_json::json;
+
+    #[test]
+    fn extracts_popularity_when_present() {
+        let metadata = json!({ "genres": ["Indie Rock"], "popularity": 0.73 });
+        let popularity = metadata.get("popularity").and_then(|p| p.as_f64());
+        assert_eq!(popularity, Some(0.73));
+    }
+
+    #[test]
+    fn returns_none_when_absent() {
+        let metadata = json!({ "genres": ["Indie Rock"] });
+        let popularity = metadata.get("popularity").and_then(|p| p.as_f64());
+        assert_eq!(popularity, None);
+    }
 }

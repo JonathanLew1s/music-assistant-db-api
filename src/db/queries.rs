@@ -136,6 +136,13 @@ LEFT JOIN audio_analysis aa_sonic
 WHERE pm.provider_item_id IS NOT NULL
 ";
 
+// Extracts the `popularity` field from a track's metadata JSON blob, if present.
+fn extract_popularity(metadata: &Option<Value>) -> Option<f64> {
+    metadata.as_ref()
+        .and_then(|m| m.get("popularity"))
+        .and_then(|p| p.as_f64())
+}
+
 // Row parser for TRACK_BASE_SCALAR — reads pre-extracted scalar columns instead
 // of full JSON blobs. Column layout must match TRACK_BASE_SCALAR exactly.
 pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
@@ -187,9 +194,7 @@ pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
         .map(String::from);
-    let popularity = metadata.as_ref()
-        .and_then(|m| m.get("popularity"))
-        .and_then(|p| p.as_f64());
+    let popularity = extract_popularity(&metadata);
 
     let camelot = key.as_deref().zip(mode.as_deref())
         .and_then(|(k, m)| to_camelot(k, m));
@@ -278,9 +283,7 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
         .map(String::from);
-    let popularity = metadata.as_ref()
-        .and_then(|m| m.get("popularity"))
-        .and_then(|p| p.as_f64());
+    let popularity = extract_popularity(&metadata);
 
     let analysis = if include_analysis {
         let loud: Option<Value> = loudness_str.as_deref().and_then(|s| serde_json::from_str(s).ok());
@@ -1314,19 +1317,20 @@ pub fn search(conn: &Connection, q: &str, limit: i64) -> Result<SearchResults> {
 
 #[cfg(test)]
 mod popularity_tests {
+    use super::extract_popularity;
     use serde_json::json;
 
     #[test]
     fn extracts_popularity_when_present() {
-        let metadata = json!({ "genres": ["Indie Rock"], "popularity": 0.73 });
-        let popularity = metadata.get("popularity").and_then(|p| p.as_f64());
+        let metadata = Some(json!({ "genres": ["Indie Rock"], "popularity": 0.73 }));
+        let popularity = extract_popularity(&metadata);
         assert_eq!(popularity, Some(0.73));
     }
 
     #[test]
     fn returns_none_when_absent() {
-        let metadata = json!({ "genres": ["Indie Rock"] });
-        let popularity = metadata.get("popularity").and_then(|p| p.as_f64());
+        let metadata = Some(json!({ "genres": ["Indie Rock"] }));
+        let popularity = extract_popularity(&metadata);
         assert_eq!(popularity, None);
     }
 }

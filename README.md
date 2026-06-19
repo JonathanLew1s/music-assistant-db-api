@@ -75,6 +75,8 @@ curl http://localhost:8096/api/v1/health/detailed
 }
 ```
 
+**Coverage is not evenly distributed across the library yet.** MA's analysis providers process tracks roughly in scan order, which in practice tracks alphabetically by artist — as of writing, ~90% of analysed tracks (`bpm`/`clap`/`sonic` coverage) are artists starting with A, B, or C, with a steep drop-off after that. Any consumer doing random sampling restricted to analysed tracks (e.g. `energy_min`/`energy_max`/`valence_min` filters) will see this skew until the analysis pass progresses further into the alphabet — it is not a bug in this service's query logic, confirmed by checking the underlying `tracks`/`audio_analysis` tables directly.
+
 ---
 
 ### `GET /api/v1/tracks`
@@ -103,6 +105,8 @@ List tracks with optional filtering.
 curl "http://localhost:8096/api/v1/tracks?energy_min=0.7&since=1749600000&include=analysis&limit=20"
 ```
 
+**`order=random` internals:** plain random order (no audio filters) and random order restricted to `energy`/`valence`/`arousal` filters both use a two-stage fast path — randomly sample matching `item_id`s from a lightweight index first, then fetch full rows for just those ids — instead of `ORDER BY RANDOM()` over the full multi-table join, which takes seconds on a large library. As of the most recent fix, the stage-2 row fetch is also itself randomly ordered (`GROUP BY item_id ORDER BY RANDOM()`); earlier versions sampled a genuinely random *set* of ids but returned them in ascending-id order, which looked alphabetically clustered to callers relying on response order for variety (e.g. a stable sort over near-tied scores). `order=random` combined with `bpm_min`/`bpm_max` falls through to a plain `ORDER BY RANDOM()` over the full join — slower, but correctly randomized today regardless.
+
 Track object:
 
 ```json
@@ -115,6 +119,7 @@ Track object:
   "album_id": 456,
   "year": 2021,
   "genre": "Electronic",
+  "popularity": null,
   "duration": 243.5,
   "file_path": "Artist/Album/01 Song.flac",
   "favorite": false,
@@ -124,6 +129,8 @@ Track object:
   "analysis": null
 }
 ```
+
+`popularity` is extracted from `tracks.metadata.popularity` (top-level, not under `analysis` — it's a metadata-provider field, not an audio-analysis one). It's `null` for almost every track today since most metadata providers don't populate it, but a small and growing number now carry a real 0–100-ish score where a provider has supplied one — null-safe by design, consumers should never assume it's populated.
 
 With `?include=analysis`:
 
@@ -330,9 +337,10 @@ The Docker image uses a two-stage Alpine build: the builder compiles with musl l
 cargo test
 ```
 
-11 unit tests covering:
+13 unit tests covering:
 - Camelot wheel conversion (7 cases — C major = 8B, D# minor = 2A, enharmonic equivalence)
 - Cosine similarity index (4 cases — identical/opposite/exclude/unknown)
+- `popularity` JSON extraction (2 cases — present/absent in `tracks.metadata`)
 
 ---
 
@@ -353,6 +361,8 @@ Not all tracks have all analysis types. MA's analysis providers run progressivel
 
 - `loudness_analysis` runs on every file — highest coverage
 - `smart_fades` (BPM, key, beats) — grows as MA processes tracks
-- `sonic_analysis` (CLAP, valence, energy) — subset; coverage shown in `/health`
+- `sonic_analysis` (CLAP, valence, energy, danceability, acousticness, instrumentalness, brightness, speechiness, roughness, harmonic_complexity, rhythmic_regularity, spectral_centroid) — subset; coverage shown in `/health`
 
 The `/health` endpoint reports current coverage counts. Fields are `null` when a track hasn't been analysed yet.
+
+**Coverage skews alphabetically by artist today.** Checked directly against the underlying `tracks`/`audio_analysis` tables: of all analysed artist-track rows, roughly 90% start with A, B, or C, with under 1% covering the rest of the alphabet combined. This is consistent with MA's analysis pass working through the library in something close to scan order rather than a random or priority order. It self-corrects as analysis continues — there's nothing to fix in this service — but any downstream consumer doing analysis-restricted random sampling (e.g. `energy_min`/`energy_max`, mood/vibe matching) should expect heavily A/B/C-skewed results until coverage broadens. This was the root cause of an apparent "random picks aren't really random" bug report from a downstream consumer (SUB/WAVE) — the query-level randomization was and is correct; the skew is entirely in which tracks have analysis to sample from.

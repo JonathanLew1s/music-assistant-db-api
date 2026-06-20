@@ -6,7 +6,6 @@ mod error;
 mod models;
 mod routes;
 mod similarity;
-mod snapshot;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -26,59 +25,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    tracing::info!("connecting to {} (snapshot path: {})", cfg.db_path, cfg.snapshot_path);
+    tracing::info!("connecting to {}", cfg.db_path);
 
-    // Take an initial snapshot before serving any traffic. "database is
-    // locked" here means MA happens to be mid-write at this exact moment —
-    // almost always transient (seconds, not hours) — so retry quickly
-    // in-process a number of times before giving up, rather than failing
-    // fast and relying on k8s's CrashLoopBackOff restart delay (which grows
-    // exponentially up to 5 minutes and hits the *same* lock window on every
-    // attempt if MA's write burst outlasts a couple of restarts). If one
-    // already exists on disk (e.g. surviving a pod restart) and every retry
-    // still fails, fall back to it rather than refusing to boot — only error
-    // out if there is truly no usable snapshot anywhere after exhausting
-    // retries.
-    const INITIAL_SNAPSHOT_RETRIES: u32 = 12;
-    const INITIAL_SNAPSHOT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-    let mut last_err = None;
-    for attempt in 1..=INITIAL_SNAPSHOT_RETRIES {
-        match snapshot::take_snapshot(cfg.db_path.clone(), cfg.snapshot_path.clone()).await {
-            Ok(()) => {
-                tracing::info!("initial snapshot taken (attempt {attempt})");
-                last_err = None;
-                break;
-            }
-            Err(e) => {
-                tracing::warn!("initial snapshot attempt {attempt}/{INITIAL_SNAPSHOT_RETRIES} failed: {e}");
-                last_err = Some(e);
-                if attempt < INITIAL_SNAPSHOT_RETRIES {
-                    tokio::time::sleep(INITIAL_SNAPSHOT_RETRY_DELAY).await;
-                }
-            }
-        }
-    }
-    if let Some(e) = last_err {
-        if std::path::Path::new(&cfg.snapshot_path).exists() {
-            tracing::warn!("all initial snapshot attempts failed, serving existing snapshot from a previous run: {e}");
-        } else {
-            return Err(anyhow::anyhow!("initial snapshot failed after {INITIAL_SNAPSHOT_RETRIES} attempts and no existing snapshot to fall back to: {e}"));
-        }
-    }
+    // MA_DB_PATH now points at a Longhorn PVC-to-PVC clone of MA's live
+    // library.db, refreshed hourly by a CronJob (see the talos GitOps repo:
+    // kubernetes/apps/music-assistant/ma-db-api-clone-refresh-cronjob.yaml)
+    // — never at the live, actively-written file directly. The clone is
+    // static between refreshes (a refresh remounts via a full pod restart,
+    // not an in-place update), so there's no write contention to retry
+    // against here. The one thing still needed: a clone taken mid-write can
+    // have a torn tail in its -wal file, so open it once with normal
+    // (non-immutable) flags first to let SQLite's own WAL recovery discard
+    // that tail — confirmed live that this produces a clean,
+    // integrity-check-passing database — before building the real
+    // immutable=1 serving pool.
+    db::recover_wal(&cfg.db_path).await?;
 
-    let pool = db::build_pool(&cfg.snapshot_path, cfg.pool_size).await?;
+    let pool = db::build_pool(&cfg.db_path, cfg.pool_size).await?;
     let shared_pool: db::SharedPool = Arc::new(RwLock::new(pool));
-
-    {
-        let shared_pool = shared_pool.clone();
-        let source_path = cfg.db_path.clone();
-        let snapshot_path = cfg.snapshot_path.clone();
-        let pool_size = cfg.pool_size;
-        let interval = cfg.snapshot_interval;
-        tokio::spawn(async move {
-            snapshot::run_periodic(shared_pool, source_path, snapshot_path, pool_size, interval).await;
-        });
-    }
 
     let sim_index = Arc::new(similarity::SimilarityIndex::empty());
     {

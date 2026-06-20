@@ -1257,60 +1257,117 @@ pub fn list_playlists(conn: &Connection, offset: i64, limit: i64) -> Result<(i64
 // Search
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct SearchResults {
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
     pub artists: Vec<Artist>,
 }
 
-pub fn search(conn: &Connection, q: &str, limit: i64) -> Result<SearchResults> {
+/// Which result sets a caller actually wants. `/search` callers that only
+/// need artists (e.g. subwave's resolveArtist retry loop) skip the track
+/// and album queries entirely instead of paying for them and discarding
+/// the result.
+#[derive(Clone, Copy)]
+pub struct SearchTypes {
+    pub tracks: bool,
+    pub albums: bool,
+    pub artists: bool,
+}
+
+impl SearchTypes {
+    pub const ALL: SearchTypes = SearchTypes { tracks: true, albums: true, artists: true };
+    #[allow(dead_code)] // convenience constant for callers/tests; routes/search.rs builds this shape from ?types= itself
+    pub const ARTISTS_ONLY: SearchTypes = SearchTypes { tracks: false, albums: false, artists: true };
+}
+
+pub fn search(conn: &Connection, q: &str, limit: i64, types: SearchTypes) -> Result<SearchResults> {
     let pattern = format!("%{q}%");
 
-    let track_sql = format!(
-        "{TRACK_BASE} AND (t.name LIKE ?1 OR a.name LIKE ?1)
-         GROUP BY t.item_id ORDER BY t.name ASC LIMIT ?2"
-    );
-    let mut stmt = conn.prepare(&track_sql)?;
-    let tracks: Vec<Track> = stmt.query_map(params![pattern, limit], |row| {
-        parse_track_row(row, false, false, false)
-    })?.collect::<rusqlite::Result<_>>()?;
+    let tracks = if types.tracks {
+        // Two-stage lookup, same idea as list_tracks' fast paths: the LIKE
+        // pattern has a leading wildcard so it can never use an index either
+        // way, but matching against the full 5-way join (3x audio_analysis)
+        // turns every search into the ~9-17s scan list_tracks' random-order
+        // fast paths were built to avoid. Find matching ids against just
+        // tracks/track_artists/artists first, then fetch full rows for only
+        // those ids.
+        let id_sql = "
+            SELECT t.item_id
+            FROM tracks t
+            LEFT JOIN track_artists ta ON ta.track_id = t.item_id
+            LEFT JOIN artists a ON a.item_id = ta.artist_id
+            WHERE (t.name LIKE ?1 OR a.name LIKE ?1)
+            GROUP BY t.item_id
+            ORDER BY t.name ASC
+            LIMIT ?2
+        ";
+        let mut id_stmt = conn.prepare(id_sql)?;
+        let matched_ids: Vec<i64> = id_stmt.query_map(params![pattern, limit], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
 
-    let album_sql = "SELECT alb.item_id, alb.name,
-                     (SELECT a.name FROM album_artists aa JOIN artists a ON a.item_id = aa.artist_id
-                      WHERE aa.album_id = alb.item_id LIMIT 1) AS artist,
-                     (SELECT aa.artist_id FROM album_artists aa WHERE aa.album_id = alb.item_id LIMIT 1) AS artist_id,
-                     alb.year,
-                     (SELECT COUNT(*) FROM album_tracks at2 WHERE at2.album_id = alb.item_id) AS track_count,
-                     alb.timestamp_added
-                     FROM albums alb WHERE alb.name LIKE ?1 ORDER BY alb.name ASC LIMIT ?2";
-    let mut stmt = conn.prepare(album_sql)?;
-    let albums: Vec<Album> = stmt.query_map(params![pattern, limit], |row| {
-        let id: i64 = row.get(0)?;
-        Ok(Album {
-            id,
-            name: row.get(1)?,
-            artist: row.get(2)?,
-            artist_id: row.get(3)?,
-            year: row.get(4)?,
-            track_count: row.get(5)?,
-            timestamp_added: row.get(6)?,
-            cover_url: format!("/api/v1/albums/{id}/cover"),
-        })
-    })?.collect::<rusqlite::Result<_>>()?;
+        if matched_ids.is_empty() {
+            vec![]
+        } else {
+            let placeholders: Vec<String> = (1..=matched_ids.len()).map(|i| format!("?{i}")).collect();
+            let track_sql = format!(
+                "{TRACK_BASE} AND t.item_id IN ({})
+                 GROUP BY t.item_id ORDER BY t.name ASC",
+                placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&track_sql)?;
+            let x = stmt.query_map(rusqlite::params_from_iter(matched_ids.iter()), |row| {
+                parse_track_row(row, false, false, false)
+            })?.collect::<rusqlite::Result<_>>()?; x
+        }
+    } else {
+        vec![]
+    };
 
-    let artist_sql = "SELECT a.item_id, a.name,
-                      (SELECT COUNT(*) FROM track_artists ta WHERE ta.artist_id = a.item_id),
-                      (SELECT COUNT(*) FROM album_artists aa WHERE aa.artist_id = a.item_id)
-                      FROM artists a WHERE a.name LIKE ?1 ORDER BY a.name ASC LIMIT ?2";
-    let mut stmt = conn.prepare(artist_sql)?;
-    let artists: Vec<Artist> = stmt.query_map(params![pattern, limit], |row| {
-        Ok(Artist {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            track_count: row.get(2)?,
-            album_count: row.get(3)?,
-        })
-    })?.collect::<rusqlite::Result<_>>()?;
+    let albums = if types.albums {
+        let album_sql = "SELECT alb.item_id, alb.name,
+                         (SELECT a.name FROM album_artists aa JOIN artists a ON a.item_id = aa.artist_id
+                          WHERE aa.album_id = alb.item_id LIMIT 1) AS artist,
+                         (SELECT aa.artist_id FROM album_artists aa WHERE aa.album_id = alb.item_id LIMIT 1) AS artist_id,
+                         alb.year,
+                         (SELECT COUNT(*) FROM album_tracks at2 WHERE at2.album_id = alb.item_id) AS track_count,
+                         alb.timestamp_added
+                         FROM albums alb WHERE alb.name LIKE ?1 ORDER BY alb.name ASC LIMIT ?2";
+        let mut stmt = conn.prepare(album_sql)?;
+        let x = stmt.query_map(params![pattern, limit], |row| {
+            let id: i64 = row.get(0)?;
+            Ok(Album {
+                id,
+                name: row.get(1)?,
+                artist: row.get(2)?,
+                artist_id: row.get(3)?,
+                year: row.get(4)?,
+                track_count: row.get(5)?,
+                timestamp_added: row.get(6)?,
+                cover_url: format!("/api/v1/albums/{id}/cover"),
+            })
+        })?.collect::<rusqlite::Result<_>>()?; x
+    } else {
+        vec![]
+    };
+
+    let artists = if types.artists {
+        let artist_sql = "SELECT a.item_id, a.name,
+                          (SELECT COUNT(*) FROM track_artists ta WHERE ta.artist_id = a.item_id),
+                          (SELECT COUNT(*) FROM album_artists aa WHERE aa.artist_id = a.item_id)
+                          FROM artists a WHERE a.name LIKE ?1 ORDER BY a.name ASC LIMIT ?2";
+        let mut stmt = conn.prepare(artist_sql)?;
+        let x = stmt.query_map(params![pattern, limit], |row| {
+            Ok(Artist {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                track_count: row.get(2)?,
+                album_count: row.get(3)?,
+            })
+        })?.collect::<rusqlite::Result<_>>()?; x
+    } else {
+        vec![]
+    };
 
     Ok(SearchResults { tracks, albums, artists })
 }
@@ -1332,5 +1389,96 @@ mod popularity_tests {
         let metadata = Some(json!({ "genres": ["Indie Rock"] }));
         let popularity = extract_popularity(&metadata);
         assert_eq!(popularity, None);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::{search, SearchTypes};
+    use rusqlite::Connection;
+
+    // Minimal schema mirroring the columns queries.rs actually touches on
+    // MA's real library.db — enough to exercise search()'s joins without
+    // needing the full production schema.
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE tracks (
+                item_id INTEGER PRIMARY KEY, name TEXT, duration REAL,
+                favorite INTEGER, timestamp_added INTEGER, timestamp_modified INTEGER,
+                metadata TEXT
+            );
+            CREATE TABLE artists (item_id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE track_artists (track_id INTEGER, artist_id INTEGER);
+            CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER);
+            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER);
+            CREATE TABLE album_artists (album_id INTEGER, artist_id INTEGER);
+            CREATE TABLE provider_mappings (
+                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+            );
+            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+            ",
+        )
+        .unwrap();
+
+        // Two tracks on the same artist/album, one unrelated artist with no tracks.
+        conn.execute_batch(
+            "
+            INSERT INTO artists (item_id, name) VALUES (1, 'Boards of Canada'), (2, 'Autechre');
+            INSERT INTO albums (item_id, name, year) VALUES (1, 'Geogaddi', 2002);
+            INSERT INTO tracks (item_id, name) VALUES (10, 'Music Is Math'), (11, 'Sunshine Recorder');
+            INSERT INTO track_artists (track_id, artist_id) VALUES (10, 1), (11, 1);
+            INSERT INTO album_tracks (track_id, album_id) VALUES (10, 1), (11, 1);
+            INSERT INTO album_artists (album_id, artist_id) VALUES (1, 1);
+            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_item_id)
+                VALUES (10, 'track', 'filesystem_local', '/music/10.flac'),
+                       (11, 'track', 'filesystem_local', '/music/11.flac');
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn finds_track_by_title_substring() {
+        let conn = test_conn();
+        let results = search(&conn, "Math", 10, SearchTypes::ALL).unwrap();
+        assert_eq!(results.tracks.len(), 1);
+        assert_eq!(results.tracks[0].title.as_deref(), Some("Music Is Math"));
+    }
+
+    #[test]
+    fn finds_track_by_artist_name() {
+        let conn = test_conn();
+        let results = search(&conn, "Boards", 10, SearchTypes::ALL).unwrap();
+        assert_eq!(results.tracks.len(), 2);
+    }
+
+    #[test]
+    fn respects_limit() {
+        let conn = test_conn();
+        let results = search(&conn, "e", 1, SearchTypes::ALL).unwrap();
+        assert_eq!(results.tracks.len(), 1);
+    }
+
+    #[test]
+    fn finds_albums_and_artists() {
+        let conn = test_conn();
+        let results = search(&conn, "Geogaddi", 10, SearchTypes::ALL).unwrap();
+        assert_eq!(results.albums.len(), 1);
+
+        let results = search(&conn, "Autechre", 10, SearchTypes::ALL).unwrap();
+        assert_eq!(results.artists.len(), 1);
+        assert_eq!(results.artists[0].name.as_deref(), Some("Autechre"));
+    }
+
+    #[test]
+    fn artists_only_skips_tracks_and_albums() {
+        let conn = test_conn();
+        let results = search(&conn, "Boards", 10, SearchTypes::ARTISTS_ONLY).unwrap();
+        assert!(results.tracks.is_empty());
+        assert!(results.albums.is_empty());
+        assert_eq!(results.artists.len(), 1);
     }
 }

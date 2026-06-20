@@ -16,6 +16,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use config::Config;
 use routes::cover::{new_cover_cache, album_cover, track_cover};
 use routes::tracks::ObservatoryCache;
+use routes::search::SearchCache;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -112,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/search", get(routes::search::search).with_state(shared_pool.clone()));
 
     let api = api.layer(axum::Extension(observatory_cache));
+    let api = api.layer(axum::Extension(SearchCache::new()));
 
     let api = if let Some(key) = cfg.api_key.clone() {
         api.layer(middleware::from_fn(move |req, next| {

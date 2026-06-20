@@ -6,7 +6,11 @@ Music Assistant runs deep audio analysis (CLAP embeddings, BPM, key, loudness, v
 
 ## How it works
 
-The service runs as a **sidecar container** in the Music Assistant pod. Both containers share the pod's volume mount, so the bridge reads `library.db` directly via a read-only SQLite connection pool. On startup it loads all CLAP embeddings (≈28 MB for 7k tracks) into a brute-force cosine similarity index. Cover art is extracted from embedded audio file tags via `lofty` and cached in an in-process LRU.
+The service runs as a **sidecar container** in the Music Assistant pod. Both containers share the pod's volume mount. On startup it loads all CLAP embeddings (≈28 MB for 7k tracks) into a brute-force cosine similarity index. Cover art is extracted from embedded audio file tags via `lofty` and cached in an in-process LRU.
+
+**The query-serving pool never reads `library.db` directly — it always reads a periodically-refreshed snapshot.** This was a deliberate fix, not the original design: reading the live, actively-written file with `immutable=1` (fast, but assumes the file never changes while open) worked fine while MA's WAL was dormant, but broke with "database disk image is malformed" errors once MA started writing through an actively-growing WAL during a heavy analysis pass — `immutable=1` skips WAL recovery entirely, so it was reading a structurally incomplete main file. It also explains an earlier symptom that looked unrelated: the `/health` **liveness probe** ran the same live-file query, so MA's own write activity could fail the probe and trigger pointless container restart loops that never fixed anything, since the live file was still being written either way.
+
+Instead, a background task takes a fresh, fully-consistent copy of `library.db` on a timer using SQLite's own `VACUUM INTO` mechanism (safe under concurrent writers, unlike a raw file copy), publishes it atomically via rename, and only then rebuilds the connection pool against the new file and swaps it in — every in-flight request keeps using the previous pool until the swap completes, so there's no window where a request can see a half-published snapshot. If a snapshot attempt fails (MA mid-write at that exact moment), it's logged and skipped; the previous snapshot keeps serving until the next interval. An initial snapshot is taken once, synchronously, at startup before any traffic is served — if that fails and a snapshot from a prior run is still on disk, it serves that rather than refusing to boot.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -34,6 +38,8 @@ The sidecar pattern avoids the ReadWriteOnce constraint on the Longhorn PVC — 
 | `PORT` | no | `8096` | Port to listen on |
 | `MA_BRIDGE_API_KEY` | no | — | If set, all requests require `Authorization: Bearer <key>` |
 | `DB_POOL_SIZE` | no | `4` | SQLite connection pool size |
+| `MA_DB_SNAPSHOT_PATH` | no | `<MA_DB_PATH>.snapshot` | Where the periodically-refreshed snapshot is written — defaults to alongside the live file on the same volume, no separate mount needed |
+| `MA_SNAPSHOT_INTERVAL_SECS` | no | `3600` | How often to refresh the snapshot |
 | `LOG_LEVEL` | no | `info` | `tracing` filter, e.g. `debug`, `info,tower_http=warn` |
 
 ## API
@@ -337,10 +343,11 @@ The Docker image uses a two-stage Alpine build: the builder compiles with musl l
 cargo test
 ```
 
-13 unit tests covering:
+15 unit tests covering:
 - Camelot wheel conversion (7 cases — C major = 8B, D# minor = 2A, enharmonic equivalence)
 - Cosine similarity index (4 cases — identical/opposite/exclude/unknown)
 - `popularity` JSON extraction (2 cases — present/absent in `tracks.metadata`)
+- Snapshot mechanics (2 cases — committed data survives the copy; a leftover tmp file from an interrupted prior attempt doesn't block the next one)
 
 ---
 

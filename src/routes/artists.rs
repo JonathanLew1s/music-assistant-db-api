@@ -1,8 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use deadpool_sqlite::Pool;
 use serde::Deserialize;
-use crate::{db::queries, error::AppError, models::{Artist, Page, track::{Track, TrackQueryParams}}};
+use crate::{db::{self, queries, SharedPool}, error::AppError, models::{Artist, Page, track::{Track, TrackQueryParams}}};
 
 #[derive(Deserialize)]
 pub struct Paged {
@@ -12,9 +11,10 @@ pub struct Paged {
 fn default_limit() -> i64 { 100 }
 
 pub async fn list_artists(
-    State(pool): State<Pool>,
+    State(shared): State<SharedPool>,
     Query(p): Query<Paged>,
 ) -> Result<Json<Page<Artist>>, AppError> {
+    let pool = db::current(&shared).await;
     let limit = p.limit.clamp(1, 1000);
     let (total, items) = pool.get().await?
         .interact(move |conn| queries::list_artists(conn, p.offset, limit))
@@ -23,9 +23,10 @@ pub async fn list_artists(
 }
 
 pub async fn get_artist(
-    State(pool): State<Pool>,
+    State(shared): State<SharedPool>,
     Path(id): Path<i64>,
 ) -> Result<Json<Artist>, AppError> {
+    let pool = db::current(&shared).await;
     let artist = pool.get().await?
         .interact(move |conn| queries::get_artist(conn, id))
         .await.map_err(|e| anyhow::anyhow!("{e}"))??
@@ -34,10 +35,11 @@ pub async fn get_artist(
 }
 
 pub async fn artist_tracks(
-    State(pool): State<Pool>,
+    State(shared): State<SharedPool>,
     Path(id): Path<i64>,
     Query(mut params): Query<TrackQueryParams>,
 ) -> Result<Json<Page<Track>>, AppError> {
+    let pool = db::current(&shared).await;
     params.artist_id = Some(id);
     let limit = params.clamped_limit();
     let offset = params.offset;

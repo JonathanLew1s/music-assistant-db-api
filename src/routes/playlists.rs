@@ -1,8 +1,7 @@
 use axum::extract::{Query, State};
 use axum::Json;
-use deadpool_sqlite::Pool;
 use serde::Deserialize;
-use crate::{db::queries, error::AppError, models::{Page, Playlist}};
+use crate::{db::{self, queries, SharedPool}, error::AppError, models::{Page, Playlist}};
 
 #[derive(Deserialize)]
 pub struct Paged {
@@ -12,9 +11,10 @@ pub struct Paged {
 fn default_limit() -> i64 { 100 }
 
 pub async fn list_playlists(
-    State(pool): State<Pool>,
+    State(shared): State<SharedPool>,
     Query(p): Query<Paged>,
 ) -> Result<Json<Page<Playlist>>, AppError> {
+    let pool = db::current(&shared).await;
     let limit = p.limit.clamp(1, 1000);
     let (total, items) = pool.get().await?
         .interact(move |conn| queries::list_playlists(conn, p.offset, limit))

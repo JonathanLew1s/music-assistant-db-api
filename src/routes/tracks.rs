@@ -2,10 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
-use deadpool_sqlite::Pool;
 use parking_lot::Mutex;
 use serde::Serialize;
-use crate::{db::queries, error::AppError, models::{Page, track::{Track, TrackQueryParams}}};
+use crate::{db::{self, queries, SharedPool}, error::AppError, models::{Page, track::{Track, TrackQueryParams}}};
 
 const OBSERVATORY_TTL: Duration = Duration::from_secs(1800);
 
@@ -31,7 +30,7 @@ pub struct ObservatoryPage {
 /// with all other track handlers — avoiding Axum route-priority issues with static vs
 /// parameterised paths.
 pub async fn observatory_tracks(
-    State(pool): State<Pool>,
+    State(shared): State<SharedPool>,
     Extension(cache): Extension<ObservatoryCache>,
 ) -> Result<Json<ObservatoryPage>, AppError> {
     // Serve from cache if still fresh.
@@ -45,6 +44,7 @@ pub async fn observatory_tracks(
     }
 
     // Cache miss — run the query.
+    let pool = db::current(&shared).await;
     let tracks = pool.get().await?
         .interact(|conn| queries::observatory_tracks(conn))
         .await.map_err(|e| anyhow::anyhow!("{e}"))??;
@@ -55,9 +55,10 @@ pub async fn observatory_tracks(
 }
 
 pub async fn list_tracks(
-    State(pool): State<Pool>,
+    State(shared): State<SharedPool>,
     Query(params): Query<TrackQueryParams>,
 ) -> Result<Json<Page<Track>>, AppError> {
+    let pool = db::current(&shared).await;
     let limit = params.clamped_limit();
     let offset = params.offset;
     let (total, items) = pool.get().await?
@@ -67,10 +68,11 @@ pub async fn list_tracks(
 }
 
 pub async fn get_track(
-    State(pool): State<Pool>,
+    State(shared): State<SharedPool>,
     Path(id): Path<i64>,
     Query(params): Query<TrackQueryParams>,
 ) -> Result<Json<Track>, AppError> {
+    let pool = db::current(&shared).await;
     let include_analysis = params.include_analysis();
     let include_clap = params.include_clap();
     let track = pool.get().await?

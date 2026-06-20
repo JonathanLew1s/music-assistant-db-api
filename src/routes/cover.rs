@@ -5,13 +5,12 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use deadpool_sqlite::Pool;
 use lofty::{file::TaggedFileExt, probe::Probe, config::ParseOptions};
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 
-use crate::{db::queries, error::AppError};
+use crate::{db::{self, queries, SharedPool}, error::AppError};
 
 pub type CoverCache = Arc<Mutex<LruCache<i64, Option<(Bytes, String)>>>>;
 
@@ -20,13 +19,14 @@ pub fn new_cover_cache() -> CoverCache {
 }
 
 pub async fn track_cover(
-    State((pool, music_root, cache)): State<(Pool, String, CoverCache)>,
+    State((shared, music_root, cache)): State<(SharedPool, String, CoverCache)>,
     Path(id): Path<i64>,
 ) -> Result<Response<Body>, AppError> {
     if let Some(cached) = cache.lock().get(&id) {
         return Ok(build_cover_response(cached));
     }
 
+    let pool = db::current(&shared).await;
     let file_path = pool.get().await?
         .interact(move |conn| queries::get_track_file_path(conn, id))
         .await.map_err(|e| anyhow::anyhow!("{e}"))??;
@@ -40,7 +40,7 @@ pub async fn track_cover(
 }
 
 pub async fn album_cover(
-    State((pool, music_root, cache)): State<(Pool, String, CoverCache)>,
+    State((shared, music_root, cache)): State<(SharedPool, String, CoverCache)>,
     Path(album_id): Path<i64>,
 ) -> Result<Response<Body>, AppError> {
     let cache_key = -album_id;
@@ -48,6 +48,7 @@ pub async fn album_cover(
         return Ok(build_cover_response(cached));
     }
 
+    let pool = db::current(&shared).await;
     let file_path: Option<String> = pool.get().await?
         .interact(move |conn| queries::get_album_first_file_path(conn, album_id))
         .await.map_err(|e| anyhow::anyhow!("{e}"))??;

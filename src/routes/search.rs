@@ -1,8 +1,7 @@
 use axum::extract::{Query, State};
 use axum::Json;
-use deadpool_sqlite::Pool;
 use serde::{Deserialize, Serialize};
-use crate::{db::queries, error::AppError, models::{Track, Album, Artist}};
+use crate::{db::{self, queries, SharedPool}, error::AppError, models::{Track, Album, Artist}};
 
 #[derive(Deserialize)]
 pub struct SearchParams {
@@ -19,12 +18,13 @@ pub struct SearchResponse {
 }
 
 pub async fn search(
-    State(pool): State<Pool>,
+    State(shared): State<SharedPool>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<SearchResponse>, AppError> {
     if params.q.trim().is_empty() {
         return Err(AppError::BadRequest("q is required".into()));
     }
+    let pool = db::current(&shared).await;
     let q = params.q.clone();
     let limit = params.limit.clamp(1, 50);
     let results = pool.get().await?

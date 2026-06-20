@@ -1,9 +1,8 @@
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use deadpool_sqlite::Pool;
 use std::sync::Arc;
-use crate::{error::AppError, similarity::SimilarityIndex};
+use crate::{db::SharedPool, error::AppError, similarity::SimilarityIndex};
 
 #[derive(Deserialize)]
 pub struct SimilarParams {
@@ -26,7 +25,7 @@ pub struct SimilarEntry {
 }
 
 pub async fn similar_tracks(
-    State((_pool, index)): State<(Pool, Arc<SimilarityIndex>)>,
+    State((_pool, index)): State<(SharedPool, Arc<SimilarityIndex>)>,
     Path(id): Path<i64>,
     Query(params): Query<SimilarParams>,
 ) -> Result<Json<SimilarResult>, AppError> {

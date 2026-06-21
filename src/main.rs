@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
                     match conn.interact(|c| db::queries::observatory_tracks(c)).await {
                         Ok(Ok(tracks)) => {
                             let total = tracks.len();
-                            *obs_cache.0.lock() = Some((std::time::Instant::now(), tracks));
+                            *obs_cache.0.lock() = Some(tracks);
                             tracing::info!("observatory cache pre-warmed: {} tracks", total);
                         }
                         Ok(Err(e)) => tracing::warn!("observatory pre-warm query error: {e}"),

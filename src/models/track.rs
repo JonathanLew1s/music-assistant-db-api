@@ -48,7 +48,7 @@ pub struct Track {
     pub analysis: Option<TrackAnalysis>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct TrackQueryParams {
     #[serde(default)]
     pub offset: i64,

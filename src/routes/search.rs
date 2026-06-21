@@ -5,7 +5,6 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use crate::{db::{self, queries::{self, SearchTypes}, SharedPool}, error::AppError, models::{Track, Album, Artist}};
 
 #[derive(Deserialize)]
@@ -41,20 +40,19 @@ pub struct SearchResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Cache — same LRU+TTL shape as ObservatoryCache/CoverCache elsewhere in this
-// API. Search terms repeat heavily in practice (the same handful of artist
-// names get looked up over and over by callers resolving fuzzy matches), so
-// a short-lived cache turns those repeats into a lock + clone instead of a
-// DB round trip.
+// Cache — LRU, no TTL. The underlying data is static for the entire life of
+// this process: the only thing that ever changes it is the hourly clone
+// refresh, which bounces the pod and wipes this cache (and every other
+// in-memory cache here) anyway. A time-based expiry would only throw away
+// hits for no correctness benefit, so eviction is LRU-size-only.
 // ---------------------------------------------------------------------------
 
 const SEARCH_CACHE_SIZE: usize = 256;
-const SEARCH_CACHE_TTL: Duration = Duration::from_secs(300);
 
 type SearchCacheKey = (String, i64, bool, bool, bool);
 
 #[derive(Clone)]
-pub struct SearchCache(Arc<Mutex<LruCache<SearchCacheKey, (Instant, queries::SearchResults)>>>);
+pub struct SearchCache(Arc<Mutex<LruCache<SearchCacheKey, queries::SearchResults>>>);
 
 impl SearchCache {
     pub fn new() -> Self {
@@ -81,14 +79,12 @@ pub async fn search(
     let types = parse_types(&params.types);
     let key = cache_key(&params.q, limit, types);
 
-    if let Some((ts, cached)) = cache.0.lock().get(&key) {
-        if ts.elapsed() < SEARCH_CACHE_TTL {
-            return Ok(Json(SearchResponse {
-                tracks: cached.tracks.clone(),
-                albums: cached.albums.clone(),
-                artists: cached.artists.clone(),
-            }));
-        }
+    if let Some(cached) = cache.0.lock().get(&key) {
+        return Ok(Json(SearchResponse {
+            tracks: cached.tracks.clone(),
+            albums: cached.albums.clone(),
+            artists: cached.artists.clone(),
+        }));
     }
 
     let pool = db::current(&shared).await;
@@ -97,7 +93,7 @@ pub async fn search(
         .interact(move |conn| queries::search(conn, &q, limit, types))
         .await.map_err(|e| anyhow::anyhow!("{e}"))??;
 
-    cache.0.lock().put(key, (Instant::now(), results.clone()));
+    cache.0.lock().put(key, results.clone());
 
     Ok(Json(SearchResponse {
         tracks: results.tracks,

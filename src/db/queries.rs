@@ -48,6 +48,106 @@ pub fn health_stats(conn: &Connection) -> Result<HealthStats> {
 }
 
 // ---------------------------------------------------------------------------
+// Audio feature materialization
+// ---------------------------------------------------------------------------
+
+// Flattens the 3 audio_analysis JSON domains (loudness_analysis, smart_fades,
+// sonic_analysis) into one real, typed table with real btree indexes —
+// called once during the clone refresh (see db::recover_wal), not per query.
+// Every list_tracks/observatory_tracks/search filter against energy, valence,
+// arousal, bpm etc. used to re-run json_extract over the JSON blob on every
+// row of every request; this pays that parsing cost exactly once per refresh
+// instead, and gives the query planner plain numeric columns it can actually
+// use range scans against — CAST(json_extract(...)) AS REAL needs an
+// expression index, which works for direct comparisons but can't be combined
+// or composed the way a normal column index can.
+//
+// Keyed by tracks.item_id (not provider_item_id — that's audio_analysis's
+// own join key, a filesystem path string) so every other query can join to
+// it with a single cheap equi-join on the same integer column it already
+// joins everything else on.
+pub fn materialize_audio_features(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS track_audio_features;
+        CREATE TABLE track_audio_features (
+            item_id INTEGER PRIMARY KEY,
+            loudness_lufs REAL,
+            loudness_album_lufs REAL,
+            bpm REAL,
+            key TEXT,
+            mode TEXT,
+            energy REAL,
+            valence REAL,
+            danceability REAL,
+            arousal REAL,
+            acousticness REAL,
+            instrumentalness REAL,
+            brightness REAL,
+            speechiness REAL,
+            roughness REAL,
+            harmonic_complexity REAL,
+            rhythmic_regularity REAL,
+            spectral_centroid REAL
+        );
+
+        INSERT INTO track_audio_features (
+            item_id, loudness_lufs, loudness_album_lufs, bpm, key, mode,
+            energy, valence, danceability, arousal, acousticness,
+            instrumentalness, brightness, speechiness, roughness,
+            harmonic_complexity, rhythmic_regularity, spectral_centroid
+        )
+        SELECT
+            pm.item_id,
+            MAX(CASE WHEN aa.aa_provider_domain='loudness_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.loudness_integrated') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='loudness_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.loudness_album') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='smart_fades'
+                THEN CAST(json_extract(aa.analysis_data, '$.bpm') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='smart_fades'
+                THEN json_extract(aa.analysis_data, '$.key') END),
+            MAX(CASE WHEN aa.aa_provider_domain='smart_fades'
+                THEN json_extract(aa.analysis_data, '$.mode') END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.energy') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.valence') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.danceability') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.arousal') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.acousticness') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.instrumentalness') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.brightness') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.speechiness') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.roughness') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.harmonic_complexity') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.rhythmic_regularity') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.spectral_centroid') AS REAL) END)
+        FROM provider_mappings pm
+        JOIN audio_analysis aa ON aa.item_id = pm.provider_item_id
+        WHERE pm.media_type='track' AND pm.provider_domain='filesystem_local'
+        GROUP BY pm.item_id;
+
+        CREATE INDEX idx_taf_energy ON track_audio_features(energy);
+        CREATE INDEX idx_taf_valence ON track_audio_features(valence);
+        CREATE INDEX idx_taf_arousal ON track_audio_features(arousal);
+        CREATE INDEX idx_taf_bpm ON track_audio_features(bpm);
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Track row parser (shared by list and get)
 // ---------------------------------------------------------------------------
 
@@ -89,6 +189,11 @@ WHERE pm.provider_item_id IS NOT NULL
 // The sonic_analysis blob contains a 1024-dim CLAP embedding + beats array;
 // transmitting it for thousands of rows is expensive. This reduces per-row
 // transfer from ~10KB to ~200 bytes — used when include=analysis_scalar.
+// Joins the flattened track_audio_features table (see queries::materialize_
+// audio_features) instead of the 3x audio_analysis LEFT JOINs TRACK_BASE
+// still needs — this variant only returns scalars, never the arrays
+// (beats/rms_energy/clap_embedding) that table doesn't carry, so it never
+// needs the raw JSON blobs in the first place.
 const TRACK_BASE_SCALAR: &str = "
 SELECT
   t.item_id,
@@ -103,23 +208,23 @@ SELECT
   alb.year,
   alb.item_id AS album_id,
   pm.provider_item_id AS file_path,
-  CAST(json_extract(aa_loud.analysis_data, '$.loudness_integrated') AS REAL) AS loudness_lufs,
-  CAST(json_extract(aa_loud.analysis_data, '$.loudness_album') AS REAL) AS loudness_album_lufs,
-  CAST(json_extract(aa_fades.analysis_data, '$.bpm') AS REAL) AS bpm,
-  json_extract(aa_fades.analysis_data, '$.key') AS fkey,
-  json_extract(aa_fades.analysis_data, '$.mode') AS fmode,
-  CAST(json_extract(aa_sonic.analysis_data, '$.energy') AS REAL) AS energy,
-  CAST(json_extract(aa_sonic.analysis_data, '$.valence') AS REAL) AS valence,
-  CAST(json_extract(aa_sonic.analysis_data, '$.danceability') AS REAL) AS danceability,
-  CAST(json_extract(aa_sonic.analysis_data, '$.arousal') AS REAL) AS arousal,
-  CAST(json_extract(aa_sonic.analysis_data, '$.acousticness') AS REAL) AS acousticness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.instrumentalness') AS REAL) AS instrumentalness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.brightness') AS REAL) AS brightness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.speechiness') AS REAL) AS speechiness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.roughness') AS REAL) AS roughness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.harmonic_complexity') AS REAL) AS harmonic_complexity,
-  CAST(json_extract(aa_sonic.analysis_data, '$.rhythmic_regularity') AS REAL) AS rhythmic_regularity,
-  CAST(json_extract(aa_sonic.analysis_data, '$.spectral_centroid') AS REAL) AS spectral_centroid
+  tf.loudness_lufs,
+  tf.loudness_album_lufs,
+  tf.bpm,
+  tf.key AS fkey,
+  tf.mode AS fmode,
+  tf.energy,
+  tf.valence,
+  tf.danceability,
+  tf.arousal,
+  tf.acousticness,
+  tf.instrumentalness,
+  tf.brightness,
+  tf.speechiness,
+  tf.roughness,
+  tf.harmonic_complexity,
+  tf.rhythmic_regularity,
+  tf.spectral_centroid
 FROM tracks t
 LEFT JOIN track_artists ta ON ta.track_id = t.item_id
 LEFT JOIN artists a ON a.item_id = ta.artist_id
@@ -127,12 +232,7 @@ LEFT JOIN album_tracks at2 ON at2.track_id = t.item_id
 LEFT JOIN albums alb ON alb.item_id = at2.album_id
 LEFT JOIN provider_mappings pm
   ON pm.item_id = t.item_id AND pm.media_type='track' AND pm.provider_domain='filesystem_local'
-LEFT JOIN audio_analysis aa_loud
-  ON aa_loud.item_id = pm.provider_item_id AND aa_loud.aa_provider_domain='loudness_analysis'
-LEFT JOIN audio_analysis aa_fades
-  ON aa_fades.item_id = pm.provider_item_id AND aa_fades.aa_provider_domain='smart_fades'
-LEFT JOIN audio_analysis aa_sonic
-  ON aa_sonic.item_id = pm.provider_item_id AND aa_sonic.aa_provider_domain='sonic_analysis'
+LEFT JOIN track_audio_features tf ON tf.item_id = t.item_id
 WHERE pm.provider_item_id IS NOT NULL
 ";
 
@@ -379,8 +479,28 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
 // Track queries
 // ---------------------------------------------------------------------------
 
+// One general two-stage path covers every filter/order combination:
+// Stage 1 finds matching item_ids against tracks/provider_mappings, plus a
+// single equi-join to track_audio_features only when an audio filter is
+// actually requested — never the full per-track join with 3x audio_analysis.
+// Ordering and LIMIT/OFFSET (or RANDOM()) apply here, so stage 2 only ever
+// hydrates at most `limit` rows. This replaced 3 hand-rolled fast-path
+// branches (random+no-filters, random+sonic-filters-but-not-bpm, and a
+// narrow non-random "has sonic_analysis" shape) plus a slow fallback that
+// caught everything else — including any bpm filter combined with
+// order=random, or any audio filter at all combined with a non-random
+// order, neither of which any branch covered, so both still ran the full
+// 9-17s join the other branches existed to avoid.
 pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<Track>)> {
-    let mut wheres: Vec<String> = vec!["pm.provider_item_id IS NOT NULL".into()];
+    let has_audio_filters = p.bpm_min.is_some() || p.bpm_max.is_some()
+        || p.energy_min.is_some() || p.energy_max.is_some()
+        || p.valence_min.is_some() || p.valence_max.is_some()
+        || p.arousal_min.is_some() || p.arousal_max.is_some();
+
+    let mut wheres: Vec<String> = vec![
+        "pm.media_type='track'".into(),
+        "pm.provider_domain='filesystem_local'".into(),
+    ];
     let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
 
     if let Some(since) = p.since {
@@ -413,38 +533,22 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         values.push(Box::new(album_id));
     }
 
-    let has_audio_filters = p.bpm_min.is_some() || p.bpm_max.is_some()
-        || p.energy_min.is_some() || p.energy_max.is_some()
-        || p.valence_min.is_some() || p.valence_max.is_some()
-        || p.arousal_min.is_some() || p.arousal_max.is_some();
-
-    macro_rules! sonic_filter {
+    // Plain comparisons against the flattened track_audio_features columns —
+    // a real btree index per column instead of CAST(json_extract(...)).
+    macro_rules! tf_filter {
         ($field:expr, $op:expr, $val:expr) => {
-            wheres.push(format!(
-                "CAST(json_extract(aa_sonic.analysis_data, '$.{}') AS REAL) {} ?{}",
-                $field, $op, values.len() + 1
-            ));
+            wheres.push(format!("tf.{} {} ?{}", $field, $op, values.len() + 1));
             values.push(Box::new($val));
         };
     }
-    macro_rules! fades_filter {
-        ($field:expr, $op:expr, $val:expr) => {
-            wheres.push(format!(
-                "CAST(json_extract(aa_fades.analysis_data, '$.{}') AS REAL) {} ?{}",
-                $field, $op, values.len() + 1
-            ));
-            values.push(Box::new($val));
-        };
-    }
-    // BPM lives in smart_fades (sonic_analysis.bpm is always null)
-    if let Some(v) = p.bpm_min { fades_filter!("bpm", ">=", v); }
-    if let Some(v) = p.bpm_max { fades_filter!("bpm", "<=", v); }
-    if let Some(v) = p.energy_min { sonic_filter!("energy", ">=", v); }
-    if let Some(v) = p.energy_max { sonic_filter!("energy", "<=", v); }
-    if let Some(v) = p.valence_min { sonic_filter!("valence", ">=", v); }
-    if let Some(v) = p.valence_max { sonic_filter!("valence", "<=", v); }
-    if let Some(v) = p.arousal_min { sonic_filter!("arousal", ">=", v); }
-    if let Some(v) = p.arousal_max { sonic_filter!("arousal", "<=", v); }
+    if let Some(v) = p.bpm_min { tf_filter!("bpm", ">=", v); }
+    if let Some(v) = p.bpm_max { tf_filter!("bpm", "<=", v); }
+    if let Some(v) = p.energy_min { tf_filter!("energy", ">=", v); }
+    if let Some(v) = p.energy_max { tf_filter!("energy", "<=", v); }
+    if let Some(v) = p.valence_min { tf_filter!("valence", ">=", v); }
+    if let Some(v) = p.valence_max { tf_filter!("valence", "<=", v); }
+    if let Some(v) = p.arousal_min { tf_filter!("arousal", ">=", v); }
+    if let Some(v) = p.arousal_max { tf_filter!("arousal", "<=", v); }
 
     let exclude_ids = p.exclude_ids();
     if !exclude_ids.is_empty() {
@@ -457,502 +561,106 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         }
     }
 
+    let where_clause = wheres.join(" AND ");
+    let limit = p.clamped_limit();
+    let offset = p.offset;
     let is_random = p.order.as_deref() == Some("random");
     let order_col = match p.order.as_deref().unwrap_or("name") {
         "timestamp_added" => "t.timestamp_added",
         "timestamp_modified" => "t.timestamp_modified",
-        "random" => "RANDOM()",
         _ => "t.name",
     };
     let order_dir = if p.dir.as_deref() == Some("desc") { "DESC" } else { "ASC" };
-    let where_clause = wheres.join(" AND ");
-    let limit = p.clamped_limit();
-    let offset = p.offset;
 
-    // Fast path: random order without audio filters.
-    // ORDER BY RANDOM() on the full 5-way join (including 3 audio_analysis tables) across
-    // 37K+ rows takes ~9s. Instead: sample item_ids from provider_mappings (indexed, no
-    // large JSON columns) then fetch full rows for only those N ids.
-    if is_random && !has_audio_filters {
-        // Stage 1: randomly sample item_ids from the lightweight provider_mappings join.
-        // provider_mappings has an index on (media_type, provider_domain) so this is fast.
-        // Build lightweight where clauses that don't need audio_analysis joins.
-        let mut pm_wheres: Vec<String> = vec![
-            "pm.media_type='track'".into(),
-            "pm.provider_domain='filesystem_local'".into(),
-        ];
-        let mut pm_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
-
-        if let Some(since) = p.since {
-            pm_wheres.push(format!("t.timestamp_modified > ?{}", pm_values.len() + 1));
-            pm_values.push(Box::new(since));
-        }
-        if let Some(fav) = p.favorite {
-            pm_wheres.push(format!("t.favorite = ?{}", pm_values.len() + 1));
-            pm_values.push(Box::new(fav as i64));
-        }
-        if let Some(ref genre) = p.genre {
-            pm_wheres.push(format!(
-                "json_extract(t.metadata, '$.genres[0]') = ?{}",
-                pm_values.len() + 1
-            ));
-            pm_values.push(Box::new(genre.clone()));
-        }
-        if let Some(artist_id) = p.artist_id {
-            pm_wheres.push(format!(
-                "EXISTS (SELECT 1 FROM track_artists ta2 WHERE ta2.track_id = t.item_id AND ta2.artist_id = ?{})",
-                pm_values.len() + 1
-            ));
-            pm_values.push(Box::new(artist_id));
-        }
-        if let Some(album_id) = p.album_id {
-            pm_wheres.push(format!(
-                "EXISTS (SELECT 1 FROM album_tracks at3 WHERE at3.track_id = t.item_id AND at3.album_id = ?{})",
-                pm_values.len() + 1
-            ));
-            pm_values.push(Box::new(album_id));
-        }
-        if !exclude_ids.is_empty() {
-            let placeholders: Vec<String> = (0..exclude_ids.len())
-                .map(|i| format!("?{}", pm_values.len() + i + 1))
-                .collect();
-            pm_wheres.push(format!("t.item_id NOT IN ({})", placeholders.join(",")));
-            for id in &exclude_ids {
-                pm_values.push(Box::new(*id));
-            }
-        }
-        let pm_where = pm_wheres.join(" AND ");
-
-        // Lightweight count — same join, no audio_analysis needed.
-        let count_sql = format!(
-            "SELECT COUNT(DISTINCT t.item_id)
-             FROM tracks t
-             JOIN provider_mappings pm ON pm.item_id = t.item_id
-             WHERE {pm_where}"
-        );
-        let total: i64 = conn.query_row(
-            &count_sql,
-            rusqlite::params_from_iter(pm_values.iter()),
-            |r| r.get(0),
-        )?;
-
-        pm_values.push(Box::new(limit));
-        let id_sql = format!(
-            "SELECT pm.item_id FROM provider_mappings pm
-             JOIN tracks t ON t.item_id = pm.item_id
-             WHERE {pm_where}
-             ORDER BY RANDOM()
-             LIMIT ?{}",
-            pm_values.len()
-        );
-        let mut id_stmt = conn.prepare(&id_sql)?;
-        let sampled_ids: Vec<i64> = id_stmt.query_map(
-            rusqlite::params_from_iter(pm_values.iter()),
-            |row| row.get(0),
-        )?.collect::<rusqlite::Result<_>>()?;
-
-        if sampled_ids.is_empty() {
-            return Ok((total, vec![]));
-        }
-
-        // Stage 2: fetch full joined rows for the sampled ids only.
-        let id_placeholders: Vec<String> = (1..=sampled_ids.len())
-            .map(|i| format!("?{i}"))
-            .collect();
-        let include_analysis = p.include_analysis();
-        let include_arrays = p.include_arrays();
-        let include_clap = p.include_clap();
-
-        let tracks: Vec<Track> = if include_analysis && !include_arrays {
-            let data_sql = format!(
-                "{TRACK_BASE_SCALAR} AND t.item_id IN ({})
-                 GROUP BY t.item_id ORDER BY RANDOM()",
-                id_placeholders.join(",")
-            );
-            let mut stmt = conn.prepare(&data_sql)?;
-            let x = stmt.query_map(
-                rusqlite::params_from_iter(sampled_ids.iter()),
-                |row| parse_track_scalar_row(row),
-            )?.collect::<rusqlite::Result<_>>()?; x
-        } else {
-            let data_sql = format!(
-                "{TRACK_BASE} AND t.item_id IN ({})
-                 GROUP BY t.item_id ORDER BY RANDOM()",
-                id_placeholders.join(",")
-            );
-            let mut stmt = conn.prepare(&data_sql)?;
-            let x = stmt.query_map(
-                rusqlite::params_from_iter(sampled_ids.iter()),
-                |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
-            )?.collect::<rusqlite::Result<_>>()?; x
-        };
-
-        return Ok((total, tracks));
-    }
-
-    // Fast path: random order with sonic filters only (energy / valence / arousal, no BPM).
-    // ORDER BY RANDOM() on the full 5-way join takes ~17s for 5K+ matching rows.
-    // Instead: scan the small sonic_analysis table (~7K rows) which already holds the
-    // analysis_data we need for filtering, sample item_ids there, then fetch full rows
-    // for only those N ids — same two-stage idea as the no-filter random fast path.
-    let has_bpm_filters = p.bpm_min.is_some() || p.bpm_max.is_some();
-    let has_sonic_only_filters = has_audio_filters && !has_bpm_filters;
-
-    if is_random && has_sonic_only_filters {
-        let mut aa_wheres: Vec<String> = vec![
-            "aa.aa_provider_domain = 'sonic_analysis'".into(),
-            "pm.media_type = 'track'".into(),
-            "pm.provider_domain = 'filesystem_local'".into(),
-        ];
-        let mut aa_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
-
-        // Energy / valence / arousal — all live in sonic_analysis.analysis_data
-        if let Some(v) = p.energy_min {
-            aa_wheres.push(format!(
-                "CAST(json_extract(aa.analysis_data, '$.energy') AS REAL) >= ?{}",
-                aa_values.len() + 1
-            ));
-            aa_values.push(Box::new(v));
-        }
-        if let Some(v) = p.energy_max {
-            aa_wheres.push(format!(
-                "CAST(json_extract(aa.analysis_data, '$.energy') AS REAL) <= ?{}",
-                aa_values.len() + 1
-            ));
-            aa_values.push(Box::new(v));
-        }
-        if let Some(v) = p.valence_min {
-            aa_wheres.push(format!(
-                "CAST(json_extract(aa.analysis_data, '$.valence') AS REAL) >= ?{}",
-                aa_values.len() + 1
-            ));
-            aa_values.push(Box::new(v));
-        }
-        if let Some(v) = p.valence_max {
-            aa_wheres.push(format!(
-                "CAST(json_extract(aa.analysis_data, '$.valence') AS REAL) <= ?{}",
-                aa_values.len() + 1
-            ));
-            aa_values.push(Box::new(v));
-        }
-        if let Some(v) = p.arousal_min {
-            aa_wheres.push(format!(
-                "CAST(json_extract(aa.analysis_data, '$.arousal') AS REAL) >= ?{}",
-                aa_values.len() + 1
-            ));
-            aa_values.push(Box::new(v));
-        }
-        if let Some(v) = p.arousal_max {
-            aa_wheres.push(format!(
-                "CAST(json_extract(aa.analysis_data, '$.arousal') AS REAL) <= ?{}",
-                aa_values.len() + 1
-            ));
-            aa_values.push(Box::new(v));
-        }
-
-        // Standard filters (since, favorite, genre, artist_id, album_id, exclude)
-        if let Some(since) = p.since {
-            aa_wheres.push(format!("t.timestamp_modified > ?{}", aa_values.len() + 1));
-            aa_values.push(Box::new(since));
-        }
-        if let Some(fav) = p.favorite {
-            aa_wheres.push(format!("t.favorite = ?{}", aa_values.len() + 1));
-            aa_values.push(Box::new(fav as i64));
-        }
-        if let Some(ref genre) = p.genre {
-            aa_wheres.push(format!(
-                "json_extract(t.metadata, '$.genres[0]') = ?{}",
-                aa_values.len() + 1
-            ));
-            aa_values.push(Box::new(genre.clone()));
-        }
-        if let Some(artist_id) = p.artist_id {
-            aa_wheres.push(format!(
-                "EXISTS (SELECT 1 FROM track_artists ta2 WHERE ta2.track_id = t.item_id AND ta2.artist_id = ?{})",
-                aa_values.len() + 1
-            ));
-            aa_values.push(Box::new(artist_id));
-        }
-        if let Some(album_id) = p.album_id {
-            aa_wheres.push(format!(
-                "EXISTS (SELECT 1 FROM album_tracks at3 WHERE at3.track_id = t.item_id AND at3.album_id = ?{})",
-                aa_values.len() + 1
-            ));
-            aa_values.push(Box::new(album_id));
-        }
-        if !exclude_ids.is_empty() {
-            let placeholders: Vec<String> = (0..exclude_ids.len())
-                .map(|i| format!("?{}", aa_values.len() + i + 1))
-                .collect();
-            aa_wheres.push(format!("t.item_id NOT IN ({})", placeholders.join(",")));
-            for id in &exclude_ids {
-                aa_values.push(Box::new(*id));
-            }
-        }
-        let aa_where = aa_wheres.join(" AND ");
-
-        let count_sql = format!(
-            "SELECT COUNT(DISTINCT pm.item_id)
-             FROM audio_analysis aa
-             JOIN provider_mappings pm ON pm.provider_item_id = aa.item_id
-             JOIN tracks t ON t.item_id = pm.item_id
-             WHERE {aa_where}"
-        );
-        let total: i64 = conn.query_row(
-            &count_sql,
-            rusqlite::params_from_iter(aa_values.iter()),
-            |r| r.get(0),
-        )?;
-
-        aa_values.push(Box::new(limit));
-        let id_sql = format!(
-            "SELECT DISTINCT pm.item_id
-             FROM audio_analysis aa
-             JOIN provider_mappings pm ON pm.provider_item_id = aa.item_id
-             JOIN tracks t ON t.item_id = pm.item_id
-             WHERE {aa_where}
-             ORDER BY RANDOM()
-             LIMIT ?{}",
-            aa_values.len()
-        );
-        let mut id_stmt = conn.prepare(&id_sql)?;
-        let sampled_ids: Vec<i64> = id_stmt.query_map(
-            rusqlite::params_from_iter(aa_values.iter()),
-            |row| row.get(0),
-        )?.collect::<rusqlite::Result<_>>()?;
-
-        if sampled_ids.is_empty() {
-            return Ok((total, vec![]));
-        }
-
-        // Stage 2: fetch full joined rows for the sampled ids only.
-        let id_placeholders: Vec<String> = (1..=sampled_ids.len())
-            .map(|i| format!("?{i}"))
-            .collect();
-        let include_analysis = p.include_analysis();
-        let include_arrays = p.include_arrays();
-        let include_clap = p.include_clap();
-
-        let tracks: Vec<Track> = if include_analysis && !include_arrays {
-            let data_sql = format!(
-                "{TRACK_BASE_SCALAR} AND t.item_id IN ({})
-                 GROUP BY t.item_id ORDER BY RANDOM()",
-                id_placeholders.join(",")
-            );
-            let mut stmt = conn.prepare(&data_sql)?;
-            let x = stmt.query_map(
-                rusqlite::params_from_iter(sampled_ids.iter()),
-                |row| parse_track_scalar_row(row),
-            )?.collect::<rusqlite::Result<_>>()?; x
-        } else {
-            let data_sql = format!(
-                "{TRACK_BASE} AND t.item_id IN ({})
-                 GROUP BY t.item_id ORDER BY RANDOM()",
-                id_placeholders.join(",")
-            );
-            let mut stmt = conn.prepare(&data_sql)?;
-            let x = stmt.query_map(
-                rusqlite::params_from_iter(sampled_ids.iter()),
-                |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
-            )?.collect::<rusqlite::Result<_>>()?; x
-        };
-
-        return Ok((total, tracks));
-    }
-
-    // Two-stage pagination fast path: use lightweight provider_mappings enumeration
-    // then fetch full rows only for the page's IDs. Same idea as the random fast path
-    // but with deterministic LIMIT/OFFSET ordering instead of RANDOM().
-    //
-    // Used when: not random AND (no audio filters OR sole filter is energy_min=0,
-    // which means "has sonic_analysis" — a JOIN presence check, not a value filter).
-    // This covers the Observatory bulk fetch (energy_min=0 to select analysed tracks).
-    let is_sonic_presence_only = p.energy_min == Some(0.0)
-        && p.energy_max.is_none()
-        && p.bpm_min.is_none() && p.bpm_max.is_none()
-        && p.valence_min.is_none() && p.valence_max.is_none()
-        && p.arousal_min.is_none() && p.arousal_max.is_none();
-    let use_two_stage_paged = !is_random && (!has_audio_filters || is_sonic_presence_only);
-
-    if use_two_stage_paged {
-        let mut pm_wheres: Vec<String> = vec![
-            "pm.media_type='track'".into(),
-            "pm.provider_domain='filesystem_local'".into(),
-        ];
-        let mut pm_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
-
-        if let Some(since) = p.since {
-            pm_wheres.push(format!("t.timestamp_modified > ?{}", pm_values.len() + 1));
-            pm_values.push(Box::new(since));
-        }
-        if let Some(fav) = p.favorite {
-            pm_wheres.push(format!("t.favorite = ?{}", pm_values.len() + 1));
-            pm_values.push(Box::new(fav as i64));
-        }
-        if let Some(ref genre) = p.genre {
-            pm_wheres.push(format!(
-                "json_extract(t.metadata, '$.genres[0]') = ?{}",
-                pm_values.len() + 1
-            ));
-            pm_values.push(Box::new(genre.clone()));
-        }
-        if let Some(artist_id) = p.artist_id {
-            pm_wheres.push(format!(
-                "EXISTS (SELECT 1 FROM track_artists ta2 WHERE ta2.track_id = t.item_id AND ta2.artist_id = ?{})",
-                pm_values.len() + 1
-            ));
-            pm_values.push(Box::new(artist_id));
-        }
-        if let Some(album_id) = p.album_id {
-            pm_wheres.push(format!(
-                "EXISTS (SELECT 1 FROM album_tracks at3 WHERE at3.track_id = t.item_id AND at3.album_id = ?{})",
-                pm_values.len() + 1
-            ));
-            pm_values.push(Box::new(album_id));
-        }
-        if !exclude_ids.is_empty() {
-            let placeholders: Vec<String> = (0..exclude_ids.len())
-                .map(|i| format!("?{}", pm_values.len() + i + 1))
-                .collect();
-            pm_wheres.push(format!("t.item_id NOT IN ({})", placeholders.join(",")));
-            for id in &exclude_ids {
-                pm_values.push(Box::new(*id));
-            }
-        }
-        let pm_where = pm_wheres.join(" AND ");
-
-        // For sonic_presence_only: inner-join to audio_analysis to keep only analysed tracks.
-        let (count_sql, id_sql_template) = if is_sonic_presence_only {
-            let count = format!(
-                "SELECT COUNT(DISTINCT pm.item_id)
-                 FROM provider_mappings pm
-                 JOIN tracks t ON t.item_id = pm.item_id
-                 JOIN audio_analysis aa_sonic ON aa_sonic.item_id = pm.provider_item_id
-                   AND aa_sonic.aa_provider_domain = 'sonic_analysis'
-                 WHERE {pm_where}"
-            );
-            // Use DISTINCT so duplicates from multiple aa_sonic rows per track don't
-            // eat into the LIMIT (the UNIQUE constraint is on 4 cols; same item_id can
-            // appear more than once if 'provider' differs).
-            let ids = format!(
-                "SELECT DISTINCT pm.item_id FROM provider_mappings pm
-                 JOIN tracks t ON t.item_id = pm.item_id
-                 JOIN audio_analysis aa_sonic ON aa_sonic.item_id = pm.provider_item_id
-                   AND aa_sonic.aa_provider_domain = 'sonic_analysis'
-                 WHERE {pm_where}
-                 ORDER BY pm.item_id ASC
-                 LIMIT ?{{limit}} OFFSET ?{{offset}}"
-            );
-            (count, ids)
-        } else {
-            let count = format!(
-                "SELECT COUNT(DISTINCT t.item_id)
-                 FROM tracks t
-                 JOIN provider_mappings pm ON pm.item_id = t.item_id
-                 WHERE {pm_where}"
-            );
-            let ids = format!(
-                "SELECT DISTINCT pm.item_id FROM provider_mappings pm
-                 JOIN tracks t ON t.item_id = pm.item_id
-                 WHERE {pm_where}
-                 ORDER BY pm.item_id ASC
-                 LIMIT ?{{limit}} OFFSET ?{{offset}}"
-            );
-            (count, ids)
-        };
-
-        let total: i64 = conn.query_row(
-            &count_sql,
-            rusqlite::params_from_iter(pm_values.iter()),
-            |r| r.get(0),
-        )?;
-
-        // Bind LIMIT and OFFSET, replacing the placeholder templates.
-        let limit_pos = pm_values.len() + 1;
-        let offset_pos = pm_values.len() + 2;
-        let id_sql = id_sql_template
-            .replace("{limit}", &limit_pos.to_string())
-            .replace("{offset}", &offset_pos.to_string());
-        pm_values.push(Box::new(limit));
-        pm_values.push(Box::new(offset));
-
-        let mut id_stmt = conn.prepare(&id_sql)?;
-        let page_ids: Vec<i64> = id_stmt.query_map(
-            rusqlite::params_from_iter(pm_values.iter()),
-            |row| row.get(0),
-        )?.collect::<rusqlite::Result<_>>()?;
-
-        if page_ids.is_empty() {
-            return Ok((total, vec![]));
-        }
-
-        let id_placeholders: Vec<String> = (1..=page_ids.len())
-            .map(|i| format!("?{i}"))
-            .collect();
-        let include_analysis = p.include_analysis();
-        let include_arrays = p.include_arrays();
-        let include_clap = p.include_clap();
-
-        // Use the scalar base query when arrays aren't needed — avoids transmitting
-        // the full analysis_data blobs (CLAP embeddings, beats arrays) from SQLite.
-        let tracks: Vec<Track> = if include_analysis && !include_arrays {
-            let data_sql = format!(
-                "{TRACK_BASE_SCALAR} AND t.item_id IN ({})
-                 GROUP BY t.item_id",
-                id_placeholders.join(",")
-            );
-            let mut stmt = conn.prepare(&data_sql)?;
-            let x = stmt.query_map(
-                rusqlite::params_from_iter(page_ids.iter()),
-                |row| parse_track_scalar_row(row),
-            )?.collect::<rusqlite::Result<_>>()?; x
-        } else {
-            let data_sql = format!(
-                "{TRACK_BASE} AND t.item_id IN ({})
-                 GROUP BY t.item_id",
-                id_placeholders.join(",")
-            );
-            let mut stmt = conn.prepare(&data_sql)?;
-            let x = stmt.query_map(
-                rusqlite::params_from_iter(page_ids.iter()),
-                |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
-            )?.collect::<rusqlite::Result<_>>()?; x
-        };
-
-        return Ok((total, tracks));
-    }
+    // Only joined when actually needed: an unfiltered or non-audio-filtered
+    // listing never touches track_audio_features (or audio_analysis) at all.
+    let audio_join = if has_audio_filters {
+        "JOIN track_audio_features tf ON tf.item_id = t.item_id"
+    } else {
+        ""
+    };
 
     let count_sql = format!(
         "SELECT COUNT(DISTINCT t.item_id)
          FROM tracks t
-         LEFT JOIN track_artists ta ON ta.track_id = t.item_id
-         LEFT JOIN album_tracks at2 ON at2.track_id = t.item_id
-         LEFT JOIN provider_mappings pm ON pm.item_id = t.item_id AND pm.media_type='track' AND pm.provider_domain='filesystem_local'
-         LEFT JOIN audio_analysis aa_sonic ON aa_sonic.item_id = pm.provider_item_id AND aa_sonic.aa_provider_domain='sonic_analysis'
-         LEFT JOIN audio_analysis aa_fades ON aa_fades.item_id = pm.provider_item_id AND aa_fades.aa_provider_domain='smart_fades'
+         JOIN provider_mappings pm ON pm.item_id = t.item_id
+         {audio_join}
          WHERE {where_clause}"
     );
     let total: i64 = conn.query_row(&count_sql, rusqlite::params_from_iter(values.iter()), |r| r.get(0))?;
 
-    let data_sql = format!(
-        "{TRACK_BASE} AND {where_clause}
-         GROUP BY t.item_id
-         ORDER BY {order_col} {order_dir}
-         LIMIT ?{} OFFSET ?{}",
-        values.len() + 1,
-        values.len() + 2
-    );
+    let limit_pos = values.len() + 1;
+    let id_sql = if is_random {
+        format!(
+            "SELECT DISTINCT t.item_id FROM tracks t
+             JOIN provider_mappings pm ON pm.item_id = t.item_id
+             {audio_join}
+             WHERE {where_clause}
+             ORDER BY RANDOM()
+             LIMIT ?{limit_pos}"
+        )
+    } else {
+        format!(
+            "SELECT DISTINCT t.item_id FROM tracks t
+             JOIN provider_mappings pm ON pm.item_id = t.item_id
+             {audio_join}
+             WHERE {where_clause}
+             ORDER BY {order_col} {order_dir}
+             LIMIT ?{limit_pos} OFFSET ?{}",
+            limit_pos + 1
+        )
+    };
     values.push(Box::new(limit));
-    values.push(Box::new(offset));
+    if !is_random {
+        values.push(Box::new(offset));
+    }
 
+    let mut id_stmt = conn.prepare(&id_sql)?;
+    let page_ids: Vec<i64> = id_stmt.query_map(
+        rusqlite::params_from_iter(values.iter()),
+        |row| row.get(0),
+    )?.collect::<rusqlite::Result<_>>()?;
+
+    if page_ids.is_empty() {
+        return Ok((total, vec![]));
+    }
+
+    // Stage 2: fetch full joined rows for only the matched/paged ids.
+    let id_placeholders: Vec<String> = (1..=page_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect();
     let include_analysis = p.include_analysis();
     let include_arrays = p.include_arrays();
     let include_clap = p.include_clap();
-    let mut stmt = conn.prepare(&data_sql)?;
-    let tracks: Vec<Track> = stmt.query_map(
-        rusqlite::params_from_iter(values.iter()),
-        |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
-    )?.collect::<rusqlite::Result<_>>()?;
+    // Stage 2's GROUP BY t.item_id doesn't preserve stage 1's order, so the
+    // requested order has to be re-applied here too — not just for RANDOM().
+    let order_suffix = if is_random {
+        " ORDER BY RANDOM()".to_string()
+    } else {
+        format!(" ORDER BY {order_col} {order_dir}")
+    };
+
+    let tracks: Vec<Track> = if include_analysis && !include_arrays {
+        let data_sql = format!(
+            "{TRACK_BASE_SCALAR} AND t.item_id IN ({}) GROUP BY t.item_id{order_suffix}",
+            id_placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&data_sql)?;
+        let x = stmt.query_map(
+            rusqlite::params_from_iter(page_ids.iter()),
+            |row| parse_track_scalar_row(row),
+        )?.collect::<rusqlite::Result<_>>()?; x
+    } else {
+        let data_sql = format!(
+            "{TRACK_BASE} AND t.item_id IN ({}) GROUP BY t.item_id{order_suffix}",
+            id_placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&data_sql)?;
+        let x = stmt.query_map(
+            rusqlite::params_from_iter(page_ids.iter()),
+            |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
+        )?.collect::<rusqlite::Result<_>>()?; x
+    };
 
     Ok((total, tracks))
 }
@@ -979,10 +687,11 @@ pub fn get_track_file_path(conn: &Connection, id: i64) -> Result<Option<String>>
 /// can use aa_sonic's implicit rowid ordering as the outer loop.  Returns every matching track
 /// in a single query — callers cache the result instead of paginating.
 pub fn observatory_tracks(conn: &Connection) -> Result<Vec<Track>> {
-    // Single LEFT JOIN with conditional aggregation instead of two separate
-    // audio_analysis LEFT JOINs — halves the number of full-table scans on the
-    // 93K-row unindexed audio_analysis table (read-only mount, can't add indexes).
-    let sql = format!("
+    // Drives from track_audio_features (one row per analysed track) instead
+    // of audio_analysis directly — what used to be conditional aggregation
+    // across however many JSON rows a track has, re-parsing each one's JSON
+    // blob, is now a single cheap equi-join on an already-flattened row.
+    let sql = "
 SELECT
   t.item_id,
   t.name,
@@ -996,46 +705,36 @@ SELECT
   alb.year,
   alb.item_id AS album_id,
   pm.provider_item_id AS file_path,
-  MAX(CASE WHEN aa_extra.aa_provider_domain='loudness_analysis'
-      THEN CAST(json_extract(aa_extra.analysis_data, '$.loudness_integrated') AS REAL) END) AS loudness_lufs,
-  MAX(CASE WHEN aa_extra.aa_provider_domain='loudness_analysis'
-      THEN CAST(json_extract(aa_extra.analysis_data, '$.loudness_album') AS REAL) END) AS loudness_album_lufs,
-  MAX(CASE WHEN aa_extra.aa_provider_domain='smart_fades'
-      THEN CAST(json_extract(aa_extra.analysis_data, '$.bpm') AS REAL) END) AS bpm,
-  MAX(CASE WHEN aa_extra.aa_provider_domain='smart_fades'
-      THEN json_extract(aa_extra.analysis_data, '$.key') END) AS fkey,
-  MAX(CASE WHEN aa_extra.aa_provider_domain='smart_fades'
-      THEN json_extract(aa_extra.analysis_data, '$.mode') END) AS fmode,
-  CAST(json_extract(aa_sonic.analysis_data, '$.energy') AS REAL) AS energy,
-  CAST(json_extract(aa_sonic.analysis_data, '$.valence') AS REAL) AS valence,
-  CAST(json_extract(aa_sonic.analysis_data, '$.danceability') AS REAL) AS danceability,
-  CAST(json_extract(aa_sonic.analysis_data, '$.arousal') AS REAL) AS arousal,
-  CAST(json_extract(aa_sonic.analysis_data, '$.acousticness') AS REAL) AS acousticness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.instrumentalness') AS REAL) AS instrumentalness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.brightness') AS REAL) AS brightness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.speechiness') AS REAL) AS speechiness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.roughness') AS REAL) AS roughness,
-  CAST(json_extract(aa_sonic.analysis_data, '$.harmonic_complexity') AS REAL) AS harmonic_complexity,
-  CAST(json_extract(aa_sonic.analysis_data, '$.rhythmic_regularity') AS REAL) AS rhythmic_regularity,
-  CAST(json_extract(aa_sonic.analysis_data, '$.spectral_centroid') AS REAL) AS spectral_centroid
-FROM audio_analysis aa_sonic
+  tf.loudness_lufs,
+  tf.loudness_album_lufs,
+  tf.bpm,
+  tf.key AS fkey,
+  tf.mode AS fmode,
+  tf.energy,
+  tf.valence,
+  tf.danceability,
+  tf.arousal,
+  tf.acousticness,
+  tf.instrumentalness,
+  tf.brightness,
+  tf.speechiness,
+  tf.roughness,
+  tf.harmonic_complexity,
+  tf.rhythmic_regularity,
+  tf.spectral_centroid
+FROM track_audio_features tf
+JOIN tracks t ON t.item_id = tf.item_id
 JOIN provider_mappings pm
-  ON pm.provider_item_id = aa_sonic.item_id
-  AND pm.media_type = 'track'
-  AND pm.provider_domain = 'filesystem_local'
-JOIN tracks t ON t.item_id = pm.item_id
+  ON pm.item_id = t.item_id AND pm.media_type = 'track' AND pm.provider_domain = 'filesystem_local'
 LEFT JOIN track_artists ta ON ta.track_id = t.item_id
 LEFT JOIN artists a ON a.item_id = ta.artist_id
 LEFT JOIN album_tracks at2 ON at2.track_id = t.item_id
 LEFT JOIN albums alb ON alb.item_id = at2.album_id
-LEFT JOIN audio_analysis aa_extra
-  ON aa_extra.item_id = aa_sonic.item_id
-  AND aa_extra.aa_provider_domain IN ('loudness_analysis', 'smart_fades')
-WHERE aa_sonic.aa_provider_domain = 'sonic_analysis'
+WHERE tf.energy IS NOT NULL
 GROUP BY t.item_id
 ORDER BY t.item_id ASC
-");
-    let mut stmt = conn.prepare(&sql)?;
+";
+    let mut stmt = conn.prepare(sql)?;
     let tracks = stmt.query_map([], |row| parse_track_scalar_row(row))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(tracks)
@@ -1480,5 +1179,283 @@ mod search_tests {
         assert!(results.tracks.is_empty());
         assert!(results.albums.is_empty());
         assert_eq!(results.artists.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod materialize_tests {
+    use super::materialize_audio_features;
+    use rusqlite::Connection;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE tracks (item_id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE provider_mappings (
+                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+            );
+            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+
+            INSERT INTO tracks (item_id, name) VALUES (10, 'Music Is Math'), (11, 'Sunshine Recorder');
+            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_item_id)
+                VALUES (10, 'track', 'filesystem_local', '/music/10.flac'),
+                       (11, 'track', 'filesystem_local', '/music/11.flac');
+
+            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
+                ('/music/10.flac', 'sonic_analysis', '{\"energy\": 0.8, \"valence\": 0.6, \"arousal\": 0.7}'),
+                ('/music/10.flac', 'smart_fades', '{\"bpm\": 128.0, \"key\": \"C\", \"mode\": \"major\"}'),
+                ('/music/10.flac', 'loudness_analysis', '{\"loudness_integrated\": -9.5}'),
+                ('/music/11.flac', 'sonic_analysis', '{\"energy\": 0.2, \"valence\": 0.3, \"arousal\": 0.1}');
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn flattens_json_into_typed_columns() {
+        let conn = test_conn();
+        materialize_audio_features(&conn).unwrap();
+
+        let (energy, bpm, key, loudness): (f64, f64, String, f64) = conn.query_row(
+            "SELECT energy, bpm, key, loudness_lufs FROM track_audio_features WHERE item_id = 10",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(energy, 0.8);
+        assert_eq!(bpm, 128.0);
+        assert_eq!(key, "C");
+        assert_eq!(loudness, -9.5);
+    }
+
+    #[test]
+    fn track_with_no_bpm_analysis_has_null_bpm() {
+        let conn = test_conn();
+        materialize_audio_features(&conn).unwrap();
+
+        let bpm: Option<f64> = conn.query_row(
+            "SELECT bpm FROM track_audio_features WHERE item_id = 11",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(bpm, None);
+    }
+
+    #[test]
+    fn rerunning_is_idempotent() {
+        let conn = test_conn();
+        materialize_audio_features(&conn).unwrap();
+        materialize_audio_features(&conn).unwrap();
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM track_audio_features", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn creates_real_btree_indexes() {
+        let conn = test_conn();
+        materialize_audio_features(&conn).unwrap();
+
+        let index_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='track_audio_features'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(index_count, 4);
+    }
+}
+
+#[cfg(test)]
+mod list_tracks_tests {
+    use super::{list_tracks, materialize_audio_features};
+    use crate::models::track::TrackQueryParams;
+    use rusqlite::Connection;
+
+    // 5 tracks: 3 with sonic_analysis+smart_fades (varying energy/bpm), 1 with
+    // only loudness (no sonic/bpm), 1 with no analysis at all. Two artists,
+    // one genre split, one favorite.
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE tracks (
+                item_id INTEGER PRIMARY KEY, name TEXT, duration REAL,
+                favorite INTEGER, timestamp_added INTEGER, timestamp_modified INTEGER,
+                metadata TEXT
+            );
+            CREATE TABLE artists (item_id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE track_artists (track_id INTEGER, artist_id INTEGER);
+            CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER);
+            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER);
+            CREATE TABLE provider_mappings (
+                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+            );
+            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+
+            INSERT INTO artists (item_id, name) VALUES (1, 'Boards of Canada');
+            INSERT INTO tracks (item_id, name, favorite, metadata) VALUES
+                (10, 'Track A', 1, '{\"genres\": [\"Ambient\"]}'),
+                (11, 'Track B', 0, '{\"genres\": [\"Ambient\"]}'),
+                (12, 'Track C', 0, '{\"genres\": [\"Techno\"]}'),
+                (13, 'Track D', 0, '{\"genres\": [\"Ambient\"]}'),
+                (14, 'Track E', 0, '{\"genres\": [\"Ambient\"]}');
+            INSERT INTO track_artists (track_id, artist_id) VALUES (10, 1), (11, 1), (12, 1), (13, 1), (14, 1);
+            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_item_id) VALUES
+                (10, 'track', 'filesystem_local', '/m/10.flac'),
+                (11, 'track', 'filesystem_local', '/m/11.flac'),
+                (12, 'track', 'filesystem_local', '/m/12.flac'),
+                (13, 'track', 'filesystem_local', '/m/13.flac'),
+                (14, 'track', 'filesystem_local', '/m/14.flac');
+
+            -- Track A: high energy, fast bpm
+            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
+                ('/m/10.flac', 'sonic_analysis', '{\"energy\": 0.9}'),
+                ('/m/10.flac', 'smart_fades', '{\"bpm\": 140.0}');
+            -- Track B: low energy, slow bpm
+            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
+                ('/m/11.flac', 'sonic_analysis', '{\"energy\": 0.1}'),
+                ('/m/11.flac', 'smart_fades', '{\"bpm\": 80.0}');
+            -- Track C: high energy, fast bpm, different genre
+            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
+                ('/m/12.flac', 'sonic_analysis', '{\"energy\": 0.95}'),
+                ('/m/12.flac', 'smart_fades', '{\"bpm\": 145.0}');
+            -- Track D: loudness only, no sonic/bpm analysis at all
+            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
+                ('/m/13.flac', 'loudness_analysis', '{\"loudness_integrated\": -8.0}');
+            -- Track E: no analysis whatsoever
+            ",
+        )
+        .unwrap();
+        materialize_audio_features(&conn).unwrap();
+        conn
+    }
+
+    fn ids(tracks: &[crate::models::Track]) -> Vec<i64> {
+        tracks.iter().map(|t| t.id).collect()
+    }
+
+    #[test]
+    fn no_filters_returns_all_tracks() {
+        let conn = test_conn();
+        let p = TrackQueryParams { limit: 50, ..Default::default() };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(tracks.len(), 5);
+    }
+
+    #[test]
+    fn no_filters_paginated_honors_requested_order() {
+        let conn = test_conn();
+        // Default order is by name; previously the fast path for this exact
+        // shape (no filters, not random) ignored the order param entirely
+        // and always sorted by item_id — name order happens to match here,
+        // but dir=desc would expose the bug if it regressed.
+        let p = TrackQueryParams { limit: 50, dir: Some("desc".into()), ..Default::default() };
+        let (_, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(tracks[0].title.as_deref(), Some("Track E"));
+        assert_eq!(tracks[4].title.as_deref(), Some("Track A"));
+    }
+
+    #[test]
+    fn bpm_filter_random_order_previously_uncovered_shape() {
+        // This combination (order=random + a bpm filter) fell through every
+        // existing fast path before this rewrite and ran the full 9-17s
+        // join. It must now return only the matching tracks.
+        let conn = test_conn();
+        let p = TrackQueryParams {
+            limit: 50,
+            bpm_min: Some(130.0),
+            order: Some("random".into()),
+            ..Default::default()
+        };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 2);
+        let mut got = ids(&tracks);
+        got.sort();
+        assert_eq!(got, vec![10, 12]);
+    }
+
+    #[test]
+    fn energy_filter_non_random_previously_uncovered_shape() {
+        // Any audio filter combined with a non-random order also fell
+        // through to the slow fallback before this rewrite.
+        let conn = test_conn();
+        let p = TrackQueryParams {
+            limit: 50,
+            energy_min: Some(0.5),
+            order: Some("name".into()),
+            ..Default::default()
+        };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(tracks[0].title.as_deref(), Some("Track A"));
+        assert_eq!(tracks[1].title.as_deref(), Some("Track C"));
+    }
+
+    #[test]
+    fn bpm_and_energy_combined() {
+        let conn = test_conn();
+        let p = TrackQueryParams {
+            limit: 50,
+            bpm_min: Some(130.0),
+            energy_max: Some(0.92),
+            ..Default::default()
+        };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(tracks[0].title.as_deref(), Some("Track A"));
+    }
+
+    #[test]
+    fn genre_filter_combined_with_audio_filter() {
+        let conn = test_conn();
+        let p = TrackQueryParams {
+            limit: 50,
+            genre: Some("Techno".into()),
+            energy_min: Some(0.5),
+            ..Default::default()
+        };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(tracks[0].title.as_deref(), Some("Track C"));
+    }
+
+    #[test]
+    fn favorite_filter_no_audio_filter() {
+        let conn = test_conn();
+        let p = TrackQueryParams { limit: 50, favorite: Some(true), ..Default::default() };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(tracks[0].title.as_deref(), Some("Track A"));
+    }
+
+    #[test]
+    fn exclude_ids_respected_with_audio_filter() {
+        let conn = test_conn();
+        let p = TrackQueryParams {
+            limit: 50,
+            bpm_min: Some(100.0),
+            exclude: Some("10".into()),
+            ..Default::default()
+        };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(tracks[0].title.as_deref(), Some("Track C"));
+    }
+
+    #[test]
+    fn tracks_without_analysis_excluded_by_audio_filter() {
+        // Track D (loudness only) and Track E (no analysis) must not match
+        // any energy/bpm filter — confirms the JOIN to track_audio_features
+        // is an inner join, not accidentally permissive.
+        let conn = test_conn();
+        let p = TrackQueryParams { limit: 50, energy_min: Some(0.0), ..Default::default() };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 3);
+        let mut got = ids(&tracks);
+        got.sort();
+        assert_eq!(got, vec![10, 11, 12]);
     }
 }

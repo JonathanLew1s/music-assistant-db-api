@@ -1,15 +1,12 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 use parking_lot::Mutex;
 use serde::Serialize;
 use crate::{db::{self, queries, SharedPool}, error::AppError, models::{Page, track::{Track, TrackQueryParams}}};
 
-const OBSERVATORY_TTL: Duration = Duration::from_secs(1800);
-
 #[derive(Clone)]
-pub struct ObservatoryCache(pub Arc<Mutex<Option<(Instant, Vec<Track>)>>>);
+pub struct ObservatoryCache(pub Arc<Mutex<Option<Vec<Track>>>>);
 
 impl ObservatoryCache {
     pub fn new() -> Self {
@@ -24,8 +21,11 @@ pub struct ObservatoryPage {
 }
 
 /// Returns all tracks that have sonic_analysis, optimised for the observatory bulk fetch.
-/// Drives the JOIN from audio_analysis (7K rows) rather than tracks (37K+), and caches
-/// the full result for OBSERVATORY_TTL so repeated page-loads are instant.
+/// Drives the JOIN from track_audio_features (one row per analysed track) rather than
+/// tracks (37K+). Cached indefinitely, not on a TTL: the underlying clone is static for
+/// the entire life of this process — the only thing that ever changes it is the hourly
+/// refresh, which bounces the pod and wipes this cache along with it anyway, so a
+/// time-based expiry would only throw away hits for no correctness benefit.
 /// Uses Extension (not State) for the cache so this handler shares the Pool state type
 /// with all other track handlers — avoiding Axum route-priority issues with static vs
 /// parameterised paths.
@@ -33,14 +33,8 @@ pub async fn observatory_tracks(
     State(shared): State<SharedPool>,
     Extension(cache): Extension<ObservatoryCache>,
 ) -> Result<Json<ObservatoryPage>, AppError> {
-    // Serve from cache if still fresh.
-    {
-        let guard = cache.0.lock();
-        if let Some((ts, ref tracks)) = *guard {
-            if ts.elapsed() < OBSERVATORY_TTL {
-                return Ok(Json(ObservatoryPage { total: tracks.len(), items: tracks.clone() }));
-            }
-        }
+    if let Some(ref tracks) = *cache.0.lock() {
+        return Ok(Json(ObservatoryPage { total: tracks.len(), items: tracks.clone() }));
     }
 
     // Cache miss — run the query.
@@ -50,7 +44,7 @@ pub async fn observatory_tracks(
         .await.map_err(|e| anyhow::anyhow!("{e}"))??;
 
     let total = tracks.len();
-    *cache.0.lock() = Some((Instant::now(), tracks.clone()));
+    *cache.0.lock() = Some(tracks.clone());
     Ok(Json(ObservatoryPage { total, items: tracks }))
 }
 

@@ -80,7 +80,7 @@ List tracks with optional filtering.
 | `offset` / `limit` | int | Pagination (limit clamped to 1–1000, default 100) |
 | `since` | unix timestamp | Only tracks modified after this time |
 | `favorite` | bool | Filter by starred/favourited status |
-| `genre` | string | Filter by first genre tag |
+| `genre` | string | Matches any tag in the track's `genres` array, not just the first |
 | `artist_id` | int | Filter to tracks by a specific artist |
 | `album_id` | int | Filter to tracks on a specific album |
 | `bpm_min` / `bpm_max` | float | BPM range |
@@ -90,7 +90,7 @@ List tracks with optional filtering.
 | `order` | `name` \| `timestamp_added` \| `timestamp_modified` \| `random` | Sort column |
 | `dir` | `asc` \| `desc` | Sort direction |
 | `exclude` | comma-separated IDs | Exclude specific track IDs |
-| `include` | `analysis` \| `analysis,clap` | Add audio analysis fields; `clap` adds the 1024-dim embedding |
+| `include` | `analysis` \| `analysis,scalar` \| `clap` \| `lyrics` | Add audio analysis fields (`scalar` omits array fields for a smaller payload); `clap` adds the 1024-dim embedding; `lyrics` adds full lyrics text — all independent, combine as needed (e.g. `analysis,lyrics`) |
 
 ```bash
 # High-energy tracks modified in the last week, with analysis
@@ -110,7 +110,7 @@ Track object:
   "album": "Album Name",
   "album_id": 456,
   "year": 2021,
-  "genre": "Electronic",
+  "genres": ["Electronic", "Ambient"],
   "popularity": null,
   "duration": 243.5,
   "file_path": "Artist/Album/01 Song.flac",
@@ -118,7 +118,8 @@ Track object:
   "timestamp_added": 1700000000,
   "timestamp_modified": 1700000000,
   "cover_url": "/api/v1/tracks/12345/cover",
-  "analysis": null
+  "analysis": null,
+  "lyrics": null
 }
 ```
 
@@ -131,11 +132,15 @@ With `?include=analysis`:
   "analysis": {
     "loudness_lufs": -10.4,
     "loudness_album_lufs": -11.2,
+    "loudness_range": 6.2,
+    "true_peak": -0.3,
     "bpm": 128.0,
     "key": "D#",
     "mode": "minor",
     "camelot": "2A",
     "beats": [0.23, 0.69, 1.16],
+    "beats_per_bar": 4.0,
+    "downbeats": [0.23, 1.16],
     "valence": 0.61,
     "energy": 0.82,
     "danceability": 0.74,
@@ -210,11 +215,16 @@ curl -o cover.jpg http://localhost:8096/api/v1/tracks/12345/cover
 | `order` | `name` \| `timestamp_added` \| `play_count` | Sort column |
 | `dir` | `asc` \| `desc` | Sort direction |
 
+Album object also carries `album_type` (`album`/`single`/`ep`/`compilation`), `label`, and `release_date`, read from `albums.metadata`.
+
 ### `GET /api/v1/albums/:id`
 
 ### `GET /api/v1/albums/:id/tracks`
 
-Accepts the same filter/include parameters as `/tracks`.
+Accepts the same filter/include parameters as `/tracks`. Defaults to physical disc/track order
+(`disc_number`, `track_number`) when no `order` param is given — pass an explicit `order` to override.
+Backed by `idx_album_tracks_album_id`, created at pod startup in `db::recover_wal` (same place
+`track_audio_features` is rebuilt every boot), so this is an indexed lookup, not a full table scan.
 
 ### `GET /api/v1/albums/:id/cover`
 
@@ -236,9 +246,39 @@ Cover art from the first track in the album.
 
 ### `GET /api/v1/playlists`
 
-### `GET /api/v1/playlists/:id/tracks`
+Lists playlists (`id`, `name`, `timestamp_modified`) only. **There is no `/playlists/:id/tracks` endpoint** —
+confirmed live against the cluster that MA stores playlist track membership in `.m3u`/JSON files on the mounted
+volume, not in `library.db`. Exposing playlist contents would mean parsing those files, a different I/O model
+than every other endpoint here (file parsing vs. SQL), and is out of scope for this service today.
 
-Returns tracks in playlist order. Accepts `?include=analysis` / `?include=analysis,clap`.
+---
+
+### `GET /api/v1/genres`
+
+MA's real genre taxonomy (`genres` + `genre_media_item_mapping` tables) — distinct from a track's `genres`
+array, which is just the flat tag list copied out of `tracks.metadata`. Genres here carry alias rollups (e.g.
+"ambient" aliases "Ambient Dub", "Kankyō Ongaku", "Space Ambient", etc.).
+
+| Parameter | Type | Description |
+|---|---|---|
+| `offset` / `limit` | int | Pagination |
+
+```json
+{
+  "id": 2,
+  "name": "ambient",
+  "description": null,
+  "aliases": ["ambient", "Ambient Dub", "Kankyō Ongaku", "Space Ambient"],
+  "track_count": 1840
+}
+```
+
+### `GET /api/v1/genres/:id`
+
+### `GET /api/v1/genres/:id/tracks`
+
+Tracks tagged with this genre via the real `genre_media_item_mapping` join — not a string match against a
+track's `genres` array. Standard `offset`/`limit` pagination.
 
 ---
 
@@ -329,10 +369,10 @@ The Docker image uses a two-stage Alpine build: the builder compiles with musl l
 cargo test
 ```
 
-13 unit tests covering:
-- Camelot wheel conversion (7 cases — C major = 8B, D# minor = 2A, enharmonic equivalence)
-- Cosine similarity index (4 cases — identical/opposite/exclude/unknown)
-- `popularity` JSON extraction (2 cases — present/absent in `tracks.metadata`)
+49 unit tests covering Camelot wheel conversion, the cosine similarity index, audio-feature flattening
+(including the newly added `loudness_range`/`true_peak`/`beats_per_bar`/`downbeats`), track listing/filtering
+(genre array membership, disc/track ordering, audio-scalar filters), lyrics opt-in gating, album metadata, the
+genre taxonomy queries, search, and the `recover_wal` startup path's idempotency across simulated pod restarts.
 
 ---
 
@@ -353,7 +393,7 @@ Not all tracks have all analysis types. MA's analysis providers run progressivel
 
 - `loudness_analysis` runs on every file — highest coverage
 - `smart_fades` (BPM, key, beats) — grows as MA processes tracks
-- `sonic_analysis` (CLAP, valence, energy, danceability, acousticness, instrumentalness, brightness, speechiness, roughness, harmonic_complexity, rhythmic_regularity, spectral_centroid) — subset; coverage shown in `/health`
+- `sonic_analysis` (CLAP, valence, energy, danceability, acousticness, instrumentalness, brightness, speechiness, roughness, harmonic_complexity, rhythmic_regularity, spectral_centroid, loudness_range, true_peak) — subset; coverage shown in `/health`
 
 The `/health` endpoint reports current coverage counts. Fields are `null` when a track hasn't been analysed yet.
 

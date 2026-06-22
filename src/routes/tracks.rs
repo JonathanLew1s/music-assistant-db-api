@@ -69,8 +69,9 @@ pub async fn get_track(
     let pool = db::current(&shared).await;
     let include_analysis = params.include_analysis();
     let include_clap = params.include_clap();
+    let include_lyrics = params.include_lyrics();
     let track = pool.get().await?
-        .interact(move |conn| queries::get_track(conn, id, include_analysis, include_clap))
+        .interact(move |conn| queries::get_track(conn, id, include_analysis, include_clap, include_lyrics))
         .await.map_err(|e| anyhow::anyhow!("{e}"))??
         .ok_or_else(|| AppError::NotFound(format!("track {id} not found")))?;
     Ok(Json(track))

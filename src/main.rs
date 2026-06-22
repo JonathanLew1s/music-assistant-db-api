@@ -110,6 +110,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/artists/:id", get(routes::artists::get_artist).with_state(shared_pool.clone()))
         .route("/artists/:id/tracks", get(routes::artists::artist_tracks).with_state(shared_pool.clone()))
         .route("/playlists", get(routes::playlists::list_playlists).with_state(shared_pool.clone()))
+        .route("/genres", get(routes::genres::list_genres).with_state(shared_pool.clone()))
+        .route("/genres/:id", get(routes::genres::get_genre).with_state(shared_pool.clone()))
+        .route("/genres/:id/tracks", get(routes::genres::genre_tracks).with_state(shared_pool.clone()))
         .route("/search", get(routes::search::search).with_state(shared_pool.clone()));
 
     let api = api.layer(axum::Extension(observatory_cache));

@@ -21,6 +21,10 @@ pub struct TrackAnalysis {
     pub harmonic_complexity: Option<f64>,
     pub rhythmic_regularity: Option<f64>,
     pub spectral_centroid: Option<f64>,
+    pub loudness_range: Option<f64>,
+    pub true_peak: Option<f64>,
+    pub beats_per_bar: Option<f64>,
+    pub downbeats: Option<Vec<f64>>,
     pub rms_energy: Option<Vec<f64>>,
     pub mbid: Option<String>,
     pub isrc: Option<String>,
@@ -37,7 +41,7 @@ pub struct Track {
     pub album: Option<String>,
     pub album_id: Option<i64>,
     pub year: Option<i64>,
-    pub genre: Option<String>,
+    pub genres: Vec<String>,
     pub popularity: Option<f64>,
     pub duration: Option<f64>,
     pub file_path: Option<String>,
@@ -46,6 +50,8 @@ pub struct Track {
     pub timestamp_modified: Option<i64>,
     pub cover_url: String,
     pub analysis: Option<TrackAnalysis>,
+    /// Full lyrics text — only when ?include=lyrics
+    pub lyrics: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -98,6 +104,9 @@ impl TrackQueryParams {
     }
     pub fn include_clap(&self) -> bool {
         self.include.as_deref().map(|s| s.contains("clap")).unwrap_or(false)
+    }
+    pub fn include_lyrics(&self) -> bool {
+        self.include.as_deref().map(|s| s.contains("lyrics")).unwrap_or(false)
     }
     pub fn exclude_ids(&self) -> Vec<i64> {
         self.exclude.as_deref().unwrap_or("").split(',')

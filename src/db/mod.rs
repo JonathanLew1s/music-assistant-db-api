@@ -53,6 +53,21 @@ pub async fn recover_wal(db_path: &str) -> anyhow::Result<()> {
         let conn = Connection::open(&db_path)?;
         conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |_| Ok(()))?;
         queries::materialize_audio_features(&conn)?;
+        // album_tracks' only native index leads with track_id, not album_id
+        // (confirmed via PRAGMA index_info against the live clone), so every
+        // album-scoped track listing was an unindexed scan of the whole
+        // table. This process owns the clone outright for its lifetime —
+        // same justification as materialize_audio_features above — but
+        // unlike that derived table, this indexes a native MA table
+        // directly, since no data transformation is needed here, just an
+        // index SQLite's own schema never shipped. IF NOT EXISTS because a
+        // freshly-cloned file never has it (each refresh replaces the file
+        // wholesale, wiping any index added in a prior pod's boot), so this
+        // must be safe to (re)run unconditionally every boot.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_album_tracks_album_id
+             ON album_tracks(album_id, disc_number, track_number);",
+        )?;
         conn.execute_batch("ANALYZE;")?;
         Ok(())
     })
@@ -85,4 +100,66 @@ pub fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
         PRAGMA mmap_size=268435456;
     ")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod recover_wal_tests {
+    use super::recover_wal;
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+
+    // recover_wal() needs a real file path (it opens with non-immutable
+    // flags for WAL recovery, then later build_pool() reopens the same path
+    // immutable=1) — an in-memory connection can't stand in for that, so
+    // this writes a real temp file rather than adding a tempfile dependency
+    // for one test.
+    fn temp_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ma-db-api-test-{name}-{}.db", std::process::id()))
+    }
+
+    fn seed_minimal_schema(path: &PathBuf) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE tracks (item_id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE provider_mappings (
+                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+            );
+            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
+            ",
+        )
+        .unwrap();
+    }
+
+    // Simulates a pod restart against a freshly-cloned file: every refresh
+    // replaces library.db wholesale, so any index this process added in a
+    // prior boot is gone — recover_wal() must succeed and produce the same
+    // schema starting from a clean file every single time, not just once.
+    #[test]
+    fn idempotent_across_repeated_boots_against_a_clean_file() {
+        let path = temp_db_path("idempotent");
+        let _ = std::fs::remove_file(&path);
+        seed_minimal_schema(&path);
+
+        let path_str = path.to_str().unwrap().to_string();
+        for _ in 0..2 {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(recover_wal(&path_str))
+                .unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        let index_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_album_tracks_album_id'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(index_count, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -10,4 +10,7 @@ pub struct Album {
     pub track_count: i64,
     pub timestamp_added: Option<i64>,
     pub cover_url: String,
+    pub album_type: Option<String>,
+    pub label: Option<String>,
+    pub release_date: Option<String>,
 }

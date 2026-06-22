@@ -7,6 +7,7 @@ use crate::models::{
     track::{Track, TrackAnalysis, TrackQueryParams},
     album::Album,
     artist::Artist,
+    genre::Genre,
     playlist::Playlist,
 };
 
@@ -88,14 +89,18 @@ pub fn materialize_audio_features(conn: &Connection) -> Result<()> {
             roughness REAL,
             harmonic_complexity REAL,
             rhythmic_regularity REAL,
-            spectral_centroid REAL
+            spectral_centroid REAL,
+            loudness_range REAL,
+            true_peak REAL,
+            beats_per_bar REAL
         );
 
         INSERT INTO track_audio_features (
             item_id, loudness_lufs, loudness_album_lufs, bpm, key, mode,
             energy, valence, danceability, arousal, acousticness,
             instrumentalness, brightness, speechiness, roughness,
-            harmonic_complexity, rhythmic_regularity, spectral_centroid
+            harmonic_complexity, rhythmic_regularity, spectral_centroid,
+            loudness_range, true_peak, beats_per_bar
         )
         SELECT
             pm.item_id,
@@ -132,7 +137,13 @@ pub fn materialize_audio_features(conn: &Connection) -> Result<()> {
             MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
                 THEN CAST(json_extract(aa.analysis_data, '$.rhythmic_regularity') AS REAL) END),
             MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.spectral_centroid') AS REAL) END)
+                THEN CAST(json_extract(aa.analysis_data, '$.spectral_centroid') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.loudness_range') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                THEN CAST(json_extract(aa.analysis_data, '$.true_peak') AS REAL) END),
+            MAX(CASE WHEN aa.aa_provider_domain='smart_fades'
+                THEN CAST(json_extract(aa.analysis_data, '$.beats_per_bar') AS REAL) END)
         FROM provider_mappings pm
         JOIN audio_analysis aa ON aa.item_id = pm.provider_item_id
         WHERE pm.media_type='track' AND pm.provider_domain='filesystem_local'
@@ -224,7 +235,10 @@ SELECT
   tf.roughness,
   tf.harmonic_complexity,
   tf.rhythmic_regularity,
-  tf.spectral_centroid
+  tf.spectral_centroid,
+  tf.loudness_range,
+  tf.true_peak,
+  tf.beats_per_bar
 FROM tracks t
 LEFT JOIN track_artists ta ON ta.track_id = t.item_id
 LEFT JOIN artists a ON a.item_id = ta.artist_id
@@ -243,9 +257,32 @@ fn extract_popularity(metadata: &Option<Value>) -> Option<f64> {
         .and_then(|p| p.as_f64())
 }
 
+// Extracts the full `genres` array from a track/album's metadata JSON blob.
+// Unlike the old genres[0]-only read, this keeps every tag MA stored.
+fn extract_genres(metadata: &Option<Value>) -> Vec<String> {
+    metadata.as_ref()
+        .and_then(|m| m.get("genres"))
+        .and_then(|g| g.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+// Extracts `lyrics` from a track's metadata JSON blob, gated by the caller's
+// ?include=lyrics flag — lyrics text can be large, so it's never parsed out
+// unless explicitly requested (same gating pattern as include_clap).
+fn extract_lyrics(metadata: &Option<Value>, include_lyrics: bool) -> Option<String> {
+    if !include_lyrics {
+        return None;
+    }
+    metadata.as_ref()
+        .and_then(|m| m.get("lyrics"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
 // Row parser for TRACK_BASE_SCALAR — reads pre-extracted scalar columns instead
 // of full JSON blobs. Column layout must match TRACK_BASE_SCALAR exactly.
-pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
+pub fn parse_track_scalar_row(row: &rusqlite::Row, include_lyrics: bool) -> rusqlite::Result<Track> {
     let id: i64 = row.get(0)?;
     let title: Option<String> = row.get(1)?;
     let duration: Option<f64> = row.get(2)?;
@@ -276,6 +313,9 @@ pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
     let harmonic_complexity: Option<f64> = row.get(26)?;
     let rhythmic_regularity: Option<f64> = row.get(27)?;
     let spectral_centroid: Option<f64> = row.get(28)?;
+    let loudness_range: Option<f64> = row.get(29)?;
+    let true_peak: Option<f64> = row.get(30)?;
+    let beats_per_bar: Option<f64> = row.get(31)?;
 
     let artists: Vec<String> = artists_str
         .as_deref()
@@ -288,13 +328,9 @@ pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
 
     let metadata: Option<serde_json::Value> = metadata_str.as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
-    let genre = metadata.as_ref()
-        .and_then(|m| m.get("genres"))
-        .and_then(|g| g.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let genres = extract_genres(&metadata);
     let popularity = extract_popularity(&metadata);
+    let lyrics = extract_lyrics(&metadata, include_lyrics);
 
     let camelot = key.as_deref().zip(mode.as_deref())
         .and_then(|(k, m)| to_camelot(k, m));
@@ -321,6 +357,10 @@ pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
             harmonic_complexity,
             rhythmic_regularity,
             spectral_centroid,
+            loudness_range,
+            true_peak,
+            beats_per_bar,
+            downbeats: None,
             rms_energy: None,
             mbid: None,
             isrc: None,
@@ -338,7 +378,7 @@ pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
         album,
         album_id,
         year,
-        genre,
+        genres,
         popularity,
         duration,
         file_path,
@@ -347,10 +387,17 @@ pub fn parse_track_scalar_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
         timestamp_modified,
         cover_url: format!("/api/v1/tracks/{id}/cover"),
         analysis,
+        lyrics,
     })
 }
 
-pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arrays: bool, include_clap: bool) -> rusqlite::Result<Track> {
+pub fn parse_track_row(
+    row: &rusqlite::Row,
+    include_analysis: bool,
+    include_arrays: bool,
+    include_clap: bool,
+    include_lyrics: bool,
+) -> rusqlite::Result<Track> {
     let id: i64 = row.get(0)?;
     let title: Option<String> = row.get(1)?;
     let duration: Option<f64> = row.get(2)?;
@@ -377,13 +424,9 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
     let artist = artists.first().cloned();
 
     let metadata: Option<Value> = metadata_str.as_deref().and_then(|s| serde_json::from_str(s).ok());
-    let genre = metadata.as_ref()
-        .and_then(|m| m.get("genres"))
-        .and_then(|g| g.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let genres = extract_genres(&metadata);
     let popularity = extract_popularity(&metadata);
+    let lyrics = extract_lyrics(&metadata, include_lyrics);
 
     let analysis = if include_analysis {
         let loud: Option<Value> = loudness_str.as_deref().and_then(|s| serde_json::from_str(s).ok());
@@ -397,6 +440,15 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
         let beats = if include_arrays {
             fades.as_ref()
                 .and_then(|v| v.get("beats"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+        } else {
+            None
+        };
+
+        let downbeats = if include_arrays {
+            fades.as_ref()
+                .and_then(|v| v.get("downbeats"))
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
         } else {
@@ -434,6 +486,8 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
             mode,
             camelot,
             beats,
+            beats_per_bar: fades.as_ref().and_then(|v| v.get("beats_per_bar")).and_then(|v| v.as_f64()),
+            downbeats,
             valence: sonic.as_ref().and_then(|v| v.get("valence")).and_then(|v| v.as_f64()),
             energy: sonic.as_ref().and_then(|v| v.get("energy")).and_then(|v| v.as_f64()),
             danceability: sonic.as_ref().and_then(|v| v.get("danceability")).and_then(|v| v.as_f64()),
@@ -446,6 +500,8 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
             harmonic_complexity: sonic.as_ref().and_then(|v| v.get("harmonic_complexity")).and_then(|v| v.as_f64()),
             rhythmic_regularity: sonic.as_ref().and_then(|v| v.get("rhythmic_regularity")).and_then(|v| v.as_f64()),
             spectral_centroid: sonic.as_ref().and_then(|v| v.get("spectral_centroid")).and_then(|v| v.as_f64()),
+            loudness_range: sonic.as_ref().and_then(|v| v.get("loudness_range")).and_then(|v| v.as_f64()),
+            true_peak: sonic.as_ref().and_then(|v| v.get("true_peak")).and_then(|v| v.as_f64()),
             rms_energy,
             mbid,
             isrc,
@@ -463,7 +519,7 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
         album,
         album_id,
         year,
-        genre,
+        genres,
         popularity,
         duration,
         file_path,
@@ -472,6 +528,7 @@ pub fn parse_track_row(row: &rusqlite::Row, include_analysis: bool, include_arra
         timestamp_modified,
         cover_url: format!("/api/v1/tracks/{id}/cover"),
         analysis,
+        lyrics,
     })
 }
 
@@ -512,8 +569,12 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
         values.push(Box::new(fav as i64));
     }
     if let Some(ref genre) = p.genre {
+        // Membership check against the full genres array, not just the first
+        // tag — a track tagged ["Indie Rock", "Shoegaze"] must match either.
+        // Unindexed either way (same as the genres[0]-only check this
+        // replaced); see docs/specs/expose-unexposed-ma-data.md Alternatives.
         wheres.push(format!(
-            "json_extract(t.metadata, '$.genres[0]') = ?{}",
+            "EXISTS (SELECT 1 FROM json_each(t.metadata, '$.genres') WHERE json_each.value = ?{})",
             values.len() + 1
         ));
         values.push(Box::new(genre.clone()));
@@ -565,10 +626,34 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
     let limit = p.clamped_limit();
     let offset = p.offset;
     let is_random = p.order.as_deref() == Some("random");
-    let order_col = match p.order.as_deref().unwrap_or("name") {
-        "timestamp_added" => "t.timestamp_added",
-        "timestamp_modified" => "t.timestamp_modified",
-        _ => "t.name",
+
+    // Default to disc/track order within an album when no explicit order
+    // was requested — matches physical album track order. Needs its own
+    // join (not the EXISTS filter above) because ORDER BY needs columns,
+    // not just a boolean match. Relies on idx_album_tracks_album_id
+    // (created in db::recover_wal) so this is an indexed lookup, not a
+    // full scan of album_tracks — see docs/specs/expose-unexposed-ma-data.md.
+    let album_order_pos = if p.order.is_none() {
+        p.album_id.map(|album_id| {
+            let pos = values.len() + 1;
+            values.push(Box::new(album_id));
+            pos
+        })
+    } else {
+        None
+    };
+    let album_order_join = match album_order_pos {
+        Some(pos) => format!("JOIN album_tracks at_order ON at_order.track_id = t.item_id AND at_order.album_id = ?{pos}"),
+        None => String::new(),
+    };
+    let order_col = if album_order_pos.is_some() {
+        "at_order.disc_number, at_order.track_number"
+    } else {
+        match p.order.as_deref().unwrap_or("name") {
+            "timestamp_added" => "t.timestamp_added",
+            "timestamp_modified" => "t.timestamp_modified",
+            _ => "t.name",
+        }
     };
     let order_dir = if p.dir.as_deref() == Some("desc") { "DESC" } else { "ASC" };
 
@@ -585,6 +670,7 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
          FROM tracks t
          JOIN provider_mappings pm ON pm.item_id = t.item_id
          {audio_join}
+         {album_order_join}
          WHERE {where_clause}"
     );
     let total: i64 = conn.query_row(&count_sql, rusqlite::params_from_iter(values.iter()), |r| r.get(0))?;
@@ -595,6 +681,7 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
             "SELECT DISTINCT t.item_id FROM tracks t
              JOIN provider_mappings pm ON pm.item_id = t.item_id
              {audio_join}
+             {album_order_join}
              WHERE {where_clause}
              ORDER BY RANDOM()
              LIMIT ?{limit_pos}"
@@ -604,6 +691,7 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
             "SELECT DISTINCT t.item_id FROM tracks t
              JOIN provider_mappings pm ON pm.item_id = t.item_id
              {audio_join}
+             {album_order_join}
              WHERE {where_clause}
              ORDER BY {order_col} {order_dir}
              LIMIT ?{limit_pos} OFFSET ?{}",
@@ -632,46 +720,57 @@ pub fn list_tracks(conn: &Connection, p: &TrackQueryParams) -> Result<(i64, Vec<
     let include_analysis = p.include_analysis();
     let include_arrays = p.include_arrays();
     let include_clap = p.include_clap();
-    // Stage 2's GROUP BY t.item_id doesn't preserve stage 1's order, so the
-    // requested order has to be re-applied here too — not just for RANDOM().
-    let order_suffix = if is_random {
-        " ORDER BY RANDOM()".to_string()
+    let include_lyrics = p.include_lyrics();
+
+    let mut tracks: Vec<Track> = if include_analysis && !include_arrays {
+        let data_sql = format!(
+            "{TRACK_BASE_SCALAR} AND t.item_id IN ({}) GROUP BY t.item_id",
+            id_placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&data_sql)?;
+        let x = stmt.query_map(
+            rusqlite::params_from_iter(page_ids.iter()),
+            |row| parse_track_scalar_row(row, include_lyrics),
+        )?.collect::<rusqlite::Result<_>>()?; x
     } else {
-        format!(" ORDER BY {order_col} {order_dir}")
+        let data_sql = format!(
+            "{TRACK_BASE} AND t.item_id IN ({}) GROUP BY t.item_id",
+            id_placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&data_sql)?;
+        let x = stmt.query_map(
+            rusqlite::params_from_iter(page_ids.iter()),
+            |row| parse_track_row(row, include_analysis, include_arrays, include_clap, include_lyrics),
+        )?.collect::<rusqlite::Result<_>>()?; x
     };
 
-    let tracks: Vec<Track> = if include_analysis && !include_arrays {
-        let data_sql = format!(
-            "{TRACK_BASE_SCALAR} AND t.item_id IN ({}) GROUP BY t.item_id{order_suffix}",
-            id_placeholders.join(",")
-        );
-        let mut stmt = conn.prepare(&data_sql)?;
-        let x = stmt.query_map(
-            rusqlite::params_from_iter(page_ids.iter()),
-            |row| parse_track_scalar_row(row),
-        )?.collect::<rusqlite::Result<_>>()?; x
-    } else {
-        let data_sql = format!(
-            "{TRACK_BASE} AND t.item_id IN ({}) GROUP BY t.item_id{order_suffix}",
-            id_placeholders.join(",")
-        );
-        let mut stmt = conn.prepare(&data_sql)?;
-        let x = stmt.query_map(
-            rusqlite::params_from_iter(page_ids.iter()),
-            |row| parse_track_row(row, include_analysis, include_arrays, include_clap),
-        )?.collect::<rusqlite::Result<_>>()?; x
-    };
+    // Stage 2's GROUP BY t.item_id doesn't preserve stage 1's order (and
+    // for disc/track order specifically, TRACK_BASE's own album_tracks join
+    // is unscoped to any one album, so it couldn't be used for ORDER BY
+    // here even if re-stated) — re-sort by stage 1's id order in Rust
+    // instead of re-running ORDER BY against a differently-shaped query.
+    let order_index: std::collections::HashMap<i64, usize> =
+        page_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    tracks.sort_by_key(|t| order_index.get(&t.id).copied().unwrap_or(usize::MAX));
 
     Ok((total, tracks))
 }
 
-pub fn get_track(conn: &Connection, id: i64, include_analysis: bool, include_clap: bool) -> Result<Option<Track>> {
+pub fn get_track(
+    conn: &Connection,
+    id: i64,
+    include_analysis: bool,
+    include_clap: bool,
+    include_lyrics: bool,
+) -> Result<Option<Track>> {
     let sql = format!(
         "{TRACK_BASE} AND t.item_id = ?1
          GROUP BY t.item_id"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map(params![id], |row| parse_track_row(row, include_analysis, true, include_clap))?;
+    let mut rows = stmt.query_map(params![id], |row| {
+        parse_track_row(row, include_analysis, true, include_clap, include_lyrics)
+    })?;
     Ok(rows.next().transpose()?)
 }
 
@@ -721,7 +820,10 @@ SELECT
   tf.roughness,
   tf.harmonic_complexity,
   tf.rhythmic_regularity,
-  tf.spectral_centroid
+  tf.spectral_centroid,
+  tf.loudness_range,
+  tf.true_peak,
+  tf.beats_per_bar
 FROM track_audio_features tf
 JOIN tracks t ON t.item_id = tf.item_id
 JOIN provider_mappings pm
@@ -735,7 +837,10 @@ GROUP BY t.item_id
 ORDER BY t.item_id ASC
 ";
     let mut stmt = conn.prepare(sql)?;
-    let tracks = stmt.query_map([], |row| parse_track_scalar_row(row))?
+    // Observatory is the bulk discovery-feature fetch, not a single-track
+    // detail view — lyrics text for 37K+ rows would balloon the cached
+    // payload for no caller need, so it's never included here.
+    let tracks = stmt.query_map([], |row| parse_track_scalar_row(row, false))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(tracks)
 }
@@ -773,6 +878,44 @@ pub fn all_clap_vectors(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
 // ---------------------------------------------------------------------------
 // Album queries
 // ---------------------------------------------------------------------------
+
+const ALBUM_COLUMNS: &str = "
+  alb.item_id, alb.name,
+  (SELECT a.name FROM album_artists aa JOIN artists a ON a.item_id = aa.artist_id
+   WHERE aa.album_id = alb.item_id LIMIT 1) AS artist,
+  (SELECT aa.artist_id FROM album_artists aa WHERE aa.album_id = alb.item_id LIMIT 1) AS artist_id,
+  alb.year,
+  (SELECT COUNT(*) FROM album_tracks at2 WHERE at2.album_id = alb.item_id) AS track_count,
+  alb.timestamp_added,
+  alb.album_type,
+  alb.metadata
+";
+
+// Shared row parser for every query selecting ALBUM_COLUMNS in that exact
+// order — label/release_date come from albums.metadata (no dedicated
+// columns on the native table), read live the same way Track's
+// popularity/genres are: cheap, unindexed, point reads with no filter need.
+fn parse_album_row(row: &rusqlite::Row) -> rusqlite::Result<Album> {
+    let id: i64 = row.get(0)?;
+    let metadata_str: Option<String> = row.get(8)?;
+    let metadata: Option<Value> = metadata_str.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let label = metadata.as_ref().and_then(|m| m.get("label")).and_then(|v| v.as_str()).map(String::from);
+    let release_date = metadata.as_ref().and_then(|m| m.get("release_date")).and_then(|v| v.as_str()).map(String::from);
+
+    Ok(Album {
+        id,
+        name: row.get(1)?,
+        artist: row.get(2)?,
+        artist_id: row.get(3)?,
+        year: row.get(4)?,
+        track_count: row.get(5)?,
+        timestamp_added: row.get(6)?,
+        cover_url: format!("/api/v1/albums/{id}/cover"),
+        album_type: row.get(7)?,
+        label,
+        release_date,
+    })
+}
 
 pub fn list_albums(
     conn: &Connection,
@@ -817,13 +960,7 @@ pub fn list_albums(
     )?;
 
     let data_sql = format!(
-        "SELECT alb.item_id, alb.name,
-                (SELECT a.name FROM album_artists aa JOIN artists a ON a.item_id = aa.artist_id
-                 WHERE aa.album_id = alb.item_id LIMIT 1) AS artist,
-                (SELECT aa.artist_id FROM album_artists aa WHERE aa.album_id = alb.item_id LIMIT 1) AS artist_id,
-                alb.year,
-                (SELECT COUNT(*) FROM album_tracks at2 WHERE at2.album_id = alb.item_id) AS track_count,
-                alb.timestamp_added
+        "SELECT {ALBUM_COLUMNS}
          FROM albums alb
          WHERE {where_clause}
          ORDER BY {order_col} {order_dir}
@@ -836,47 +973,16 @@ pub fn list_albums(
     let mut stmt = conn.prepare(&data_sql)?;
     let albums: Vec<Album> = stmt.query_map(
         rusqlite::params_from_iter(values.iter()),
-        |row| {
-            let id: i64 = row.get(0)?;
-            Ok(Album {
-                id,
-                name: row.get(1)?,
-                artist: row.get(2)?,
-                artist_id: row.get(3)?,
-                year: row.get(4)?,
-                track_count: row.get(5)?,
-                timestamp_added: row.get(6)?,
-                cover_url: format!("/api/v1/albums/{id}/cover"),
-            })
-        },
+        parse_album_row,
     )?.collect::<rusqlite::Result<_>>()?;
 
     Ok((total, albums))
 }
 
 pub fn get_album(conn: &Connection, id: i64) -> Result<Option<Album>> {
-    let sql = "SELECT alb.item_id, alb.name,
-               (SELECT a.name FROM album_artists aa JOIN artists a ON a.item_id = aa.artist_id
-                WHERE aa.album_id = alb.item_id LIMIT 1) AS artist,
-               (SELECT aa.artist_id FROM album_artists aa WHERE aa.album_id = alb.item_id LIMIT 1) AS artist_id,
-               alb.year,
-               (SELECT COUNT(*) FROM album_tracks at2 WHERE at2.album_id = alb.item_id) AS track_count,
-               alb.timestamp_added
-               FROM albums alb WHERE alb.item_id = ?1";
-    let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query_map(params![id], |row| {
-        let id: i64 = row.get(0)?;
-        Ok(Album {
-            id,
-            name: row.get(1)?,
-            artist: row.get(2)?,
-            artist_id: row.get(3)?,
-            year: row.get(4)?,
-            track_count: row.get(5)?,
-            timestamp_added: row.get(6)?,
-            cover_url: format!("/api/v1/albums/{id}/cover"),
-        })
-    })?;
+    let sql = format!("SELECT {ALBUM_COLUMNS} FROM albums alb WHERE alb.item_id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map(params![id], parse_album_row)?;
     Ok(rows.next().transpose()?)
 }
 
@@ -930,6 +1036,91 @@ pub fn get_artist(conn: &Connection, id: i64) -> Result<Option<Artist>> {
         })
     })?;
     Ok(rows.next().transpose()?)
+}
+
+// ---------------------------------------------------------------------------
+// Genre queries
+// ---------------------------------------------------------------------------
+
+// MA's real genre taxonomy (genres + genre_media_item_mapping) — separate
+// from the flat tracks.metadata.genres array. Already well-indexed upstream:
+// genre_media_item_mapping_genre_alias_idx leads with genre_id, so a lookup
+// by genre is an indexed search, not a scan (confirmed via PRAGMA index_info
+// against the live clone — see docs/DB_API_GAP_ANALYSIS.md). No new index
+// needed for either query below.
+fn parse_genre_row(row: &rusqlite::Row) -> rusqlite::Result<Genre> {
+    let aliases_str: Option<String> = row.get(3)?;
+    let aliases: Vec<String> = aliases_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default();
+    Ok(Genre {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        aliases,
+        track_count: row.get(4)?,
+    })
+}
+
+pub fn list_genres(conn: &Connection, offset: i64, limit: i64) -> Result<(i64, Vec<Genre>)> {
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM genres", [], |r| r.get(0))?;
+    let sql = "SELECT g.item_id, g.name, g.description, g.genre_aliases,
+               (SELECT COUNT(*) FROM genre_media_item_mapping gmm
+                WHERE gmm.genre_id = g.item_id AND gmm.media_type = 'track') AS track_count
+               FROM genres g
+               ORDER BY g.name ASC
+               LIMIT ?1 OFFSET ?2";
+    let mut stmt = conn.prepare(sql)?;
+    let genres: Vec<Genre> = stmt.query_map(params![limit, offset], parse_genre_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok((total, genres))
+}
+
+pub fn get_genre(conn: &Connection, id: i64) -> Result<Option<Genre>> {
+    let sql = "SELECT g.item_id, g.name, g.description, g.genre_aliases,
+               (SELECT COUNT(*) FROM genre_media_item_mapping gmm
+                WHERE gmm.genre_id = g.item_id AND gmm.media_type = 'track') AS track_count
+               FROM genres g WHERE g.item_id = ?1";
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query_map(params![id], parse_genre_row)?;
+    Ok(rows.next().transpose()?)
+}
+
+/// Tracks tagged with a given genre, via genre_media_item_mapping — the real
+/// taxonomy join, not the tracks.metadata.genres[0]/array string match.
+pub fn genre_tracks(conn: &Connection, genre_id: i64, offset: i64, limit: i64) -> Result<(i64, Vec<Track>)> {
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM genre_media_item_mapping gmm
+         WHERE gmm.genre_id = ?1 AND gmm.media_type = 'track'",
+        params![genre_id],
+        |r| r.get(0),
+    )?;
+
+    let id_sql = "SELECT gmm.media_id FROM genre_media_item_mapping gmm
+                  WHERE gmm.genre_id = ?1 AND gmm.media_type = 'track'
+                  ORDER BY gmm.media_id ASC
+                  LIMIT ?2 OFFSET ?3";
+    let mut id_stmt = conn.prepare(id_sql)?;
+    let page_ids: Vec<i64> = id_stmt.query_map(params![genre_id, limit, offset], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if page_ids.is_empty() {
+        return Ok((total, vec![]));
+    }
+
+    let id_placeholders: Vec<String> = (1..=page_ids.len()).map(|i| format!("?{i}")).collect();
+    let data_sql = format!(
+        "{TRACK_BASE} AND t.item_id IN ({}) GROUP BY t.item_id ORDER BY t.name ASC",
+        id_placeholders.join(",")
+    );
+    let mut stmt = conn.prepare(&data_sql)?;
+    let tracks: Vec<Track> = stmt.query_map(
+        rusqlite::params_from_iter(page_ids.iter()),
+        |row| parse_track_row(row, false, false, false, false),
+    )?.collect::<rusqlite::Result<_>>()?;
+
+    Ok((total, tracks))
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,7 +1207,7 @@ pub fn search(conn: &Connection, q: &str, limit: i64, types: SearchTypes) -> Res
             );
             let mut stmt = conn.prepare(&track_sql)?;
             let x = stmt.query_map(rusqlite::params_from_iter(matched_ids.iter()), |row| {
-                parse_track_row(row, false, false, false)
+                parse_track_row(row, false, false, false, false)
             })?.collect::<rusqlite::Result<_>>()?; x
         }
     } else {
@@ -1024,28 +1215,12 @@ pub fn search(conn: &Connection, q: &str, limit: i64, types: SearchTypes) -> Res
     };
 
     let albums = if types.albums {
-        let album_sql = "SELECT alb.item_id, alb.name,
-                         (SELECT a.name FROM album_artists aa JOIN artists a ON a.item_id = aa.artist_id
-                          WHERE aa.album_id = alb.item_id LIMIT 1) AS artist,
-                         (SELECT aa.artist_id FROM album_artists aa WHERE aa.album_id = alb.item_id LIMIT 1) AS artist_id,
-                         alb.year,
-                         (SELECT COUNT(*) FROM album_tracks at2 WHERE at2.album_id = alb.item_id) AS track_count,
-                         alb.timestamp_added
-                         FROM albums alb WHERE alb.name LIKE ?1 ORDER BY alb.name ASC LIMIT ?2";
-        let mut stmt = conn.prepare(album_sql)?;
-        let x = stmt.query_map(params![pattern, limit], |row| {
-            let id: i64 = row.get(0)?;
-            Ok(Album {
-                id,
-                name: row.get(1)?,
-                artist: row.get(2)?,
-                artist_id: row.get(3)?,
-                year: row.get(4)?,
-                track_count: row.get(5)?,
-                timestamp_added: row.get(6)?,
-                cover_url: format!("/api/v1/albums/{id}/cover"),
-            })
-        })?.collect::<rusqlite::Result<_>>()?; x
+        let album_sql = format!(
+            "SELECT {ALBUM_COLUMNS} FROM albums alb WHERE alb.name LIKE ?1 ORDER BY alb.name ASC LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&album_sql)?;
+        let x = stmt.query_map(params![pattern, limit], parse_album_row)?
+            .collect::<rusqlite::Result<_>>()?; x
     } else {
         vec![]
     };
@@ -1110,8 +1285,8 @@ mod search_tests {
             );
             CREATE TABLE artists (item_id INTEGER PRIMARY KEY, name TEXT);
             CREATE TABLE track_artists (track_id INTEGER, artist_id INTEGER);
-            CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER);
-            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER);
+            CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER, album_type TEXT, metadata TEXT);
+            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
             CREATE TABLE album_artists (album_id INTEGER, artist_id INTEGER);
             CREATE TABLE provider_mappings (
                 item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
@@ -1203,8 +1378,8 @@ mod materialize_tests {
                        (11, 'track', 'filesystem_local', '/music/11.flac');
 
             INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
-                ('/music/10.flac', 'sonic_analysis', '{\"energy\": 0.8, \"valence\": 0.6, \"arousal\": 0.7}'),
-                ('/music/10.flac', 'smart_fades', '{\"bpm\": 128.0, \"key\": \"C\", \"mode\": \"major\"}'),
+                ('/music/10.flac', 'sonic_analysis', '{\"energy\": 0.8, \"valence\": 0.6, \"arousal\": 0.7, \"loudness_range\": 6.2, \"true_peak\": -0.3}'),
+                ('/music/10.flac', 'smart_fades', '{\"bpm\": 128.0, \"key\": \"C\", \"mode\": \"major\", \"beats_per_bar\": 4.0}'),
                 ('/music/10.flac', 'loudness_analysis', '{\"loudness_integrated\": -9.5}'),
                 ('/music/11.flac', 'sonic_analysis', '{\"energy\": 0.2, \"valence\": 0.3, \"arousal\": 0.1}');
             ",
@@ -1227,6 +1402,21 @@ mod materialize_tests {
         assert_eq!(bpm, 128.0);
         assert_eq!(key, "C");
         assert_eq!(loudness, -9.5);
+    }
+
+    #[test]
+    fn flattens_newly_added_scalars() {
+        let conn = test_conn();
+        materialize_audio_features(&conn).unwrap();
+
+        let (loudness_range, true_peak, beats_per_bar): (f64, f64, f64) = conn.query_row(
+            "SELECT loudness_range, true_peak, beats_per_bar FROM track_audio_features WHERE item_id = 10",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(loudness_range, 6.2);
+        assert_eq!(true_peak, -0.3);
+        assert_eq!(beats_per_bar, 4.0);
     }
 
     #[test]
@@ -1287,8 +1477,8 @@ mod list_tracks_tests {
             );
             CREATE TABLE artists (item_id INTEGER PRIMARY KEY, name TEXT);
             CREATE TABLE track_artists (track_id INTEGER, artist_id INTEGER);
-            CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER);
-            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER);
+            CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER, album_type TEXT, metadata TEXT);
+            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
             CREATE TABLE provider_mappings (
                 item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
             );
@@ -1302,6 +1492,15 @@ mod list_tracks_tests {
                 (13, 'Track D', 0, '{\"genres\": [\"Ambient\"]}'),
                 (14, 'Track E', 0, '{\"genres\": [\"Ambient\"]}');
             INSERT INTO track_artists (track_id, artist_id) VALUES (10, 1), (11, 1), (12, 1), (13, 1), (14, 1);
+            INSERT INTO albums (item_id, name) VALUES (1, 'Geogaddi');
+            -- Deliberately inserted out of disc/track order to prove ordering
+            -- isn't coming from insertion order or name order (B < A < C by
+            -- name too, which would mask a bug) — disc/track order here is
+            -- B (disc1/track1), A (disc1/track2), C (disc2/track1).
+            INSERT INTO album_tracks (track_id, album_id, disc_number, track_number) VALUES
+                (10, 1, 1, 2),
+                (11, 1, 1, 1),
+                (12, 1, 2, 1);
             INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_item_id) VALUES
                 (10, 'track', 'filesystem_local', '/m/10.flac'),
                 (11, 'track', 'filesystem_local', '/m/11.flac'),
@@ -1423,12 +1622,71 @@ mod list_tracks_tests {
     }
 
     #[test]
+    fn genre_filter_matches_non_first_tag_in_array() {
+        // Track C is tagged ["Techno", "Industrial"] — filtering by the
+        // second tag must still match, unlike the old genres[0]-only check.
+        let conn = test_conn();
+        conn.execute(
+            "UPDATE tracks SET metadata = '{\"genres\": [\"Techno\", \"Industrial\"]}' WHERE item_id = 12",
+            [],
+        ).unwrap();
+        let p = TrackQueryParams { limit: 50, genre: Some("Industrial".into()), ..Default::default() };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(tracks[0].title.as_deref(), Some("Track C"));
+    }
+
+    #[test]
+    fn full_genres_array_returned_not_just_first_tag() {
+        let conn = test_conn();
+        conn.execute(
+            "UPDATE tracks SET metadata = '{\"genres\": [\"Techno\", \"Industrial\"]}' WHERE item_id = 12",
+            [],
+        ).unwrap();
+        let p = TrackQueryParams { limit: 50, favorite: None, ..Default::default() };
+        let (_, tracks) = list_tracks(&conn, &p).unwrap();
+        let track_c = tracks.iter().find(|t| t.id == 12).unwrap();
+        assert_eq!(track_c.genres, vec!["Techno".to_string(), "Industrial".to_string()]);
+    }
+
+    #[test]
     fn favorite_filter_no_audio_filter() {
         let conn = test_conn();
         let p = TrackQueryParams { limit: 50, favorite: Some(true), ..Default::default() };
         let (total, tracks) = list_tracks(&conn, &p).unwrap();
         assert_eq!(total, 1);
         assert_eq!(tracks[0].title.as_deref(), Some("Track A"));
+    }
+
+    #[test]
+    fn album_id_filter_defaults_to_disc_and_track_order() {
+        // Inserted out of disc/track order and out of name order (see fixture
+        // comment) — only a real disc_number/track_number ORDER BY can produce
+        // B, A, C here.
+        let conn = test_conn();
+        let p = TrackQueryParams { limit: 50, album_id: Some(1), ..Default::default() };
+        let (total, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            tracks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+            vec![Some("Track B".to_string()), Some("Track A".to_string()), Some("Track C".to_string())],
+        );
+    }
+
+    #[test]
+    fn album_id_filter_explicit_order_overrides_disc_track_default() {
+        let conn = test_conn();
+        let p = TrackQueryParams {
+            limit: 50,
+            album_id: Some(1),
+            order: Some("name".into()),
+            ..Default::default()
+        };
+        let (_, tracks) = list_tracks(&conn, &p).unwrap();
+        assert_eq!(
+            tracks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+            vec![Some("Track A".to_string()), Some("Track B".to_string()), Some("Track C".to_string())],
+        );
     }
 
     #[test]
@@ -1457,5 +1715,184 @@ mod list_tracks_tests {
         let mut got = ids(&tracks);
         got.sort();
         assert_eq!(got, vec![10, 11, 12]);
+    }
+}
+
+#[cfg(test)]
+mod lyrics_tests {
+    use super::get_track;
+    use rusqlite::Connection;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE tracks (
+                item_id INTEGER PRIMARY KEY, name TEXT, duration REAL,
+                favorite INTEGER, timestamp_added INTEGER, timestamp_modified INTEGER,
+                metadata TEXT
+            );
+            CREATE TABLE artists (item_id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE track_artists (track_id INTEGER, artist_id INTEGER);
+            CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER, album_type TEXT, metadata TEXT);
+            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
+            CREATE TABLE provider_mappings (
+                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+            );
+            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+
+            INSERT INTO tracks (item_id, name, metadata) VALUES
+                (20, 'Dead People', '{\"genres\": [\"Hip Hop\"], \"lyrics\": \"I''m a handle business\"}');
+            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_item_id)
+                VALUES (20, 'track', 'filesystem_local', '/m/20.flac');
+            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
+                ('/m/20.flac', 'smart_fades', '{\"bpm\": 90.0, \"downbeats\": [0.5, 2.5], \"beats_per_bar\": 4.0}');
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn lyrics_omitted_by_default() {
+        let conn = test_conn();
+        let track = get_track(&conn, 20, false, false, false).unwrap().unwrap();
+        assert_eq!(track.lyrics, None);
+    }
+
+    #[test]
+    fn lyrics_included_when_requested() {
+        let conn = test_conn();
+        let track = get_track(&conn, 20, false, false, true).unwrap().unwrap();
+        assert_eq!(track.lyrics.as_deref(), Some("I'm a handle business"));
+    }
+
+    #[test]
+    fn downbeats_and_beats_per_bar_included_with_full_analysis() {
+        let conn = test_conn();
+        let track = get_track(&conn, 20, true, false, false).unwrap().unwrap();
+        let analysis = track.analysis.unwrap();
+        assert_eq!(analysis.downbeats, Some(vec![0.5, 2.5]));
+        assert_eq!(analysis.beats_per_bar, Some(4.0));
+    }
+}
+
+#[cfg(test)]
+mod album_metadata_tests {
+    use super::{get_album, list_albums};
+    use rusqlite::Connection;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE albums (
+                item_id INTEGER PRIMARY KEY, name TEXT, sort_name TEXT, year INTEGER,
+                timestamp_added INTEGER, play_count INTEGER, album_type TEXT, metadata TEXT
+            );
+            CREATE TABLE album_artists (album_id INTEGER, artist_id INTEGER);
+            CREATE TABLE artists (item_id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
+
+            INSERT INTO artists (item_id, name) VALUES (88, 'Boards of Canada');
+            INSERT INTO albums (item_id, name, year, album_type, metadata) VALUES
+                (312, 'Geogaddi', 2002, 'album',
+                 '{\"label\": \"Warp Records\", \"release_date\": \"2002-02-18\"}');
+            INSERT INTO album_artists (album_id, artist_id) VALUES (312, 88);
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn get_album_includes_label_release_date_and_type() {
+        let conn = test_conn();
+        let album = get_album(&conn, 312).unwrap().unwrap();
+        assert_eq!(album.album_type.as_deref(), Some("album"));
+        assert_eq!(album.label.as_deref(), Some("Warp Records"));
+        assert_eq!(album.release_date.as_deref(), Some("2002-02-18"));
+    }
+
+    #[test]
+    fn list_albums_includes_label_release_date_and_type() {
+        let conn = test_conn();
+        let (total, albums) = list_albums(&conn, 0, 100, None, "name", "asc", None).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(albums[0].label.as_deref(), Some("Warp Records"));
+    }
+}
+
+#[cfg(test)]
+mod genre_taxonomy_tests {
+    use super::{get_genre, genre_tracks, list_genres};
+    use rusqlite::Connection;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE tracks (
+                item_id INTEGER PRIMARY KEY, name TEXT, duration REAL,
+                favorite INTEGER, timestamp_added INTEGER, timestamp_modified INTEGER,
+                metadata TEXT
+            );
+            CREATE TABLE artists (item_id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE track_artists (track_id INTEGER, artist_id INTEGER);
+            CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER, album_type TEXT, metadata TEXT);
+            CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
+            CREATE TABLE provider_mappings (
+                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+            );
+            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+            CREATE TABLE genres (
+                item_id INTEGER PRIMARY KEY, name TEXT, description TEXT, genre_aliases TEXT
+            );
+            CREATE TABLE genre_media_item_mapping (
+                genre_id INTEGER, media_id INTEGER, media_type TEXT
+            );
+
+            INSERT INTO genres (item_id, name, description, genre_aliases) VALUES
+                (1, 'ambient', NULL, '[\"ambient\", \"Ambient Dub\"]'),
+                (2, 'techno', NULL, '[]');
+            INSERT INTO tracks (item_id, name) VALUES (10, 'Music Is Math'), (11, 'Sunshine Recorder'), (12, 'Drone');
+            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_item_id) VALUES
+                (10, 'track', 'filesystem_local', '/m/10.flac'),
+                (11, 'track', 'filesystem_local', '/m/11.flac'),
+                (12, 'track', 'filesystem_local', '/m/12.flac');
+            INSERT INTO genre_media_item_mapping (genre_id, media_id, media_type) VALUES
+                (1, 10, 'track'), (1, 11, 'track'), (2, 12, 'track');
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn list_genres_returns_track_counts() {
+        let conn = test_conn();
+        let (total, genres) = list_genres(&conn, 0, 100).unwrap();
+        assert_eq!(total, 2);
+        let ambient = genres.iter().find(|g| g.name.as_deref() == Some("ambient")).unwrap();
+        assert_eq!(ambient.track_count, 2);
+        assert_eq!(ambient.aliases, vec!["ambient".to_string(), "Ambient Dub".to_string()]);
+    }
+
+    #[test]
+    fn get_genre_by_id() {
+        let conn = test_conn();
+        let genre = get_genre(&conn, 2).unwrap().unwrap();
+        assert_eq!(genre.name.as_deref(), Some("techno"));
+        assert_eq!(genre.track_count, 1);
+    }
+
+    #[test]
+    fn genre_tracks_returns_only_mapped_tracks() {
+        let conn = test_conn();
+        let (total, tracks) = genre_tracks(&conn, 1, 0, 100).unwrap();
+        assert_eq!(total, 2);
+        let mut ids: Vec<i64> = tracks.iter().map(|t| t.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![10, 11]);
     }
 }

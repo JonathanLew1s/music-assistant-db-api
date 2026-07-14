@@ -102,52 +102,56 @@ pub fn materialize_audio_features(conn: &Connection) -> Result<()> {
             harmonic_complexity, rhythmic_regularity, spectral_centroid,
             loudness_range, true_peak, beats_per_bar
         )
+        -- Each domain's fields are pulled via one multi-path json_extract
+        -- call instead of one call per field: sonic_analysis rows carry a
+        -- 1024-dim CLAP embedding alongside these scalars (~88KB/row at
+        -- current library size), and json_extract reparses the whole blob
+        -- on every call, so 14 separate calls meant 14 full reparses of that
+        -- ~88KB text per row. A single call returns all 14 values as one
+        -- small JSON array, which is then cheap to unpack by index below.
         SELECT
-            pm.item_id,
-            MAX(CASE WHEN aa.aa_provider_domain='loudness_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.loudness_integrated') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='loudness_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.loudness_album') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='smart_fades'
-                THEN CAST(json_extract(aa.analysis_data, '$.bpm') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='smart_fades'
-                THEN json_extract(aa.analysis_data, '$.key') END),
-            MAX(CASE WHEN aa.aa_provider_domain='smart_fades'
-                THEN json_extract(aa.analysis_data, '$.mode') END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.energy') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.valence') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.danceability') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.arousal') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.acousticness') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.instrumentalness') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.brightness') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.speechiness') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.roughness') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.harmonic_complexity') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.rhythmic_regularity') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.spectral_centroid') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.loudness_range') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
-                THEN CAST(json_extract(aa.analysis_data, '$.true_peak') AS REAL) END),
-            MAX(CASE WHEN aa.aa_provider_domain='smart_fades'
-                THEN CAST(json_extract(aa.analysis_data, '$.beats_per_bar') AS REAL) END)
-        FROM provider_mappings pm
-        JOIN audio_analysis aa ON aa.item_id = pm.provider_item_id
-        WHERE pm.media_type='track' AND pm.provider_domain='filesystem_local'
-        GROUP BY pm.item_id;
+            item_id,
+            CAST(json_extract(loud, '$[0]') AS REAL),
+            CAST(json_extract(loud, '$[1]') AS REAL),
+            CAST(json_extract(fades, '$[0]') AS REAL),
+            json_extract(fades, '$[1]'),
+            json_extract(fades, '$[2]'),
+            CAST(json_extract(sonic, '$[0]') AS REAL),
+            CAST(json_extract(sonic, '$[1]') AS REAL),
+            CAST(json_extract(sonic, '$[2]') AS REAL),
+            CAST(json_extract(sonic, '$[3]') AS REAL),
+            CAST(json_extract(sonic, '$[4]') AS REAL),
+            CAST(json_extract(sonic, '$[5]') AS REAL),
+            CAST(json_extract(sonic, '$[6]') AS REAL),
+            CAST(json_extract(sonic, '$[7]') AS REAL),
+            CAST(json_extract(sonic, '$[8]') AS REAL),
+            CAST(json_extract(sonic, '$[9]') AS REAL),
+            CAST(json_extract(sonic, '$[10]') AS REAL),
+            CAST(json_extract(sonic, '$[11]') AS REAL),
+            CAST(json_extract(sonic, '$[12]') AS REAL),
+            CAST(json_extract(sonic, '$[13]') AS REAL),
+            CAST(json_extract(fades, '$[3]') AS REAL)
+        FROM (
+            SELECT
+                pm.item_id,
+                MAX(CASE WHEN aa.aa_provider_domain='loudness_analysis'
+                    THEN json_extract(aa.analysis_data,
+                        '$.loudness_integrated', '$.loudness_album') END) AS loud,
+                MAX(CASE WHEN aa.aa_provider_domain='smart_fades'
+                    THEN json_extract(aa.analysis_data,
+                        '$.bpm', '$.key', '$.mode', '$.beats_per_bar') END) AS fades,
+                MAX(CASE WHEN aa.aa_provider_domain='sonic_analysis'
+                    THEN json_extract(aa.analysis_data,
+                        '$.energy', '$.valence', '$.danceability', '$.arousal',
+                        '$.acousticness', '$.instrumentalness', '$.brightness',
+                        '$.speechiness', '$.roughness', '$.harmonic_complexity',
+                        '$.rhythmic_regularity', '$.spectral_centroid',
+                        '$.loudness_range', '$.true_peak') END) AS sonic
+            FROM provider_mappings pm
+            JOIN audio_analysis aa ON aa.item_id = pm.provider_item_id
+            WHERE pm.media_type='track' AND pm.provider_domain='filesystem_local'
+            GROUP BY pm.item_id
+        );
 
         CREATE INDEX idx_taf_energy ON track_audio_features(energy);
         CREATE INDEX idx_taf_valence ON track_audio_features(valence);

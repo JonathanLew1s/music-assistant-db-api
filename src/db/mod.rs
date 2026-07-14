@@ -123,9 +123,10 @@ mod recover_wal_tests {
             "
             CREATE TABLE tracks (item_id INTEGER PRIMARY KEY, name TEXT);
             CREATE TABLE provider_mappings (
-                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+                item_id INTEGER, media_type TEXT, provider_domain TEXT,
+                provider_instance TEXT, provider_item_id TEXT
             );
-            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+            CREATE TABLE audio_analysis (item_id TEXT, provider TEXT, aa_provider_domain TEXT, analysis_data TEXT);
             CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
             ",
         )

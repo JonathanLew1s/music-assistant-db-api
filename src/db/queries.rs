@@ -147,8 +147,21 @@ pub fn materialize_audio_features(conn: &Connection) -> Result<()> {
                         '$.speechiness', '$.roughness', '$.harmonic_complexity',
                         '$.rhythmic_regularity', '$.spectral_centroid',
                         '$.loudness_range', '$.true_peak') END) AS sonic
+            -- MA also runs a lighter loudness-only pass against the
+            -- opensubsonic provider instance, and a small acoustid_lookup
+            -- domain against filesystem_local itself; both are irrelevant to
+            -- the analysis cache this API exposes over REST (filesystem_local
+            -- only). The join key alone (item_id) never actually collided
+            -- across providers in practice — filesystem_local's item_id is a
+            -- file path, opensubsonic/spotify use opaque provider IDs — but
+            -- scoping explicitly on provider_instance is correct rather than
+            -- incidental, and the domain restriction also skips ~40K
+            -- acoustid_lookup rows this table has no columns for.
             FROM provider_mappings pm
-            JOIN audio_analysis aa ON aa.item_id = pm.provider_item_id
+            JOIN audio_analysis aa
+                ON aa.item_id = pm.provider_item_id
+                AND aa.provider = pm.provider_instance
+                AND aa.aa_provider_domain IN ('loudness_analysis', 'smart_fades', 'sonic_analysis')
             WHERE pm.media_type='track' AND pm.provider_domain='filesystem_local'
             GROUP BY pm.item_id
         );
@@ -191,11 +204,14 @@ LEFT JOIN albums alb ON alb.item_id = at2.album_id
 LEFT JOIN provider_mappings pm
   ON pm.item_id = t.item_id AND pm.media_type='track' AND pm.provider_domain='filesystem_local'
 LEFT JOIN audio_analysis aa_loud
-  ON aa_loud.item_id = pm.provider_item_id AND aa_loud.aa_provider_domain='loudness_analysis'
+  ON aa_loud.item_id = pm.provider_item_id AND aa_loud.provider = pm.provider_instance
+  AND aa_loud.aa_provider_domain='loudness_analysis'
 LEFT JOIN audio_analysis aa_fades
-  ON aa_fades.item_id = pm.provider_item_id AND aa_fades.aa_provider_domain='smart_fades'
+  ON aa_fades.item_id = pm.provider_item_id AND aa_fades.provider = pm.provider_instance
+  AND aa_fades.aa_provider_domain='smart_fades'
 LEFT JOIN audio_analysis aa_sonic
-  ON aa_sonic.item_id = pm.provider_item_id AND aa_sonic.aa_provider_domain='sonic_analysis'
+  ON aa_sonic.item_id = pm.provider_item_id AND aa_sonic.provider = pm.provider_instance
+  AND aa_sonic.aa_provider_domain='sonic_analysis'
 WHERE pm.provider_item_id IS NOT NULL
 ";
 
@@ -1293,9 +1309,10 @@ mod search_tests {
             CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
             CREATE TABLE album_artists (album_id INTEGER, artist_id INTEGER);
             CREATE TABLE provider_mappings (
-                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+                item_id INTEGER, media_type TEXT, provider_domain TEXT,
+                provider_instance TEXT, provider_item_id TEXT
             );
-            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+            CREATE TABLE audio_analysis (item_id TEXT, provider TEXT, aa_provider_domain TEXT, analysis_data TEXT);
             ",
         )
         .unwrap();
@@ -1372,24 +1389,46 @@ mod materialize_tests {
             "
             CREATE TABLE tracks (item_id INTEGER PRIMARY KEY, name TEXT);
             CREATE TABLE provider_mappings (
-                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+                item_id INTEGER, media_type TEXT, provider_domain TEXT,
+                provider_instance TEXT, provider_item_id TEXT
             );
-            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+            CREATE TABLE audio_analysis (item_id TEXT, provider TEXT, aa_provider_domain TEXT, analysis_data TEXT);
 
             INSERT INTO tracks (item_id, name) VALUES (10, 'Music Is Math'), (11, 'Sunshine Recorder');
-            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_item_id)
-                VALUES (10, 'track', 'filesystem_local', '/music/10.flac'),
-                       (11, 'track', 'filesystem_local', '/music/11.flac');
+            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_instance, provider_item_id)
+                VALUES (10, 'track', 'filesystem_local', 'filesystem_local--test', '/music/10.flac'),
+                       (11, 'track', 'filesystem_local', 'filesystem_local--test', '/music/11.flac');
 
-            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
-                ('/music/10.flac', 'sonic_analysis', '{\"energy\": 0.8, \"valence\": 0.6, \"arousal\": 0.7, \"loudness_range\": 6.2, \"true_peak\": -0.3}'),
-                ('/music/10.flac', 'smart_fades', '{\"bpm\": 128.0, \"key\": \"C\", \"mode\": \"major\", \"beats_per_bar\": 4.0}'),
-                ('/music/10.flac', 'loudness_analysis', '{\"loudness_integrated\": -9.5}'),
-                ('/music/11.flac', 'sonic_analysis', '{\"energy\": 0.2, \"valence\": 0.3, \"arousal\": 0.1}');
+            INSERT INTO audio_analysis (item_id, provider, aa_provider_domain, analysis_data) VALUES
+                ('/music/10.flac', 'filesystem_local--test', 'sonic_analysis', '{\"energy\": 0.8, \"valence\": 0.6, \"arousal\": 0.7, \"loudness_range\": 6.2, \"true_peak\": -0.3}'),
+                ('/music/10.flac', 'filesystem_local--test', 'smart_fades', '{\"bpm\": 128.0, \"key\": \"C\", \"mode\": \"major\", \"beats_per_bar\": 4.0}'),
+                ('/music/10.flac', 'filesystem_local--test', 'loudness_analysis', '{\"loudness_integrated\": -9.5}'),
+                ('/music/11.flac', 'filesystem_local--test', 'sonic_analysis', '{\"energy\": 0.2, \"valence\": 0.3, \"arousal\": 0.1}'),
+                -- Same item_id text as track 10's file, but under a
+                -- different provider instance (e.g. an opensubsonic mirror
+                -- exposing the same path string) with a decoy bpm. Proves
+                -- the provider_instance scoping, not incidental id-format
+                -- non-collision, is what keeps this out of track 10's row.
+                ('/music/10.flac', 'opensubsonic--decoy', 'smart_fades', '{\"bpm\": 999.0, \"key\": \"X\", \"mode\": \"minor\", \"beats_per_bar\": 3.0}');
             ",
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn ignores_other_providers_analysis_for_the_same_path_string() {
+        let conn = test_conn();
+        materialize_audio_features(&conn).unwrap();
+
+        let (bpm, key, beats_per_bar): (f64, String, f64) = conn.query_row(
+            "SELECT bpm, key, beats_per_bar FROM track_audio_features WHERE item_id = 10",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(bpm, 128.0);
+        assert_eq!(key, "C");
+        assert_eq!(beats_per_bar, 4.0);
     }
 
     #[test]
@@ -1484,9 +1523,10 @@ mod list_tracks_tests {
             CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER, album_type TEXT, metadata TEXT);
             CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
             CREATE TABLE provider_mappings (
-                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+                item_id INTEGER, media_type TEXT, provider_domain TEXT,
+                provider_instance TEXT, provider_item_id TEXT
             );
-            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+            CREATE TABLE audio_analysis (item_id TEXT, provider TEXT, aa_provider_domain TEXT, analysis_data TEXT);
 
             INSERT INTO artists (item_id, name) VALUES (1, 'Boards of Canada');
             INSERT INTO tracks (item_id, name, favorite, metadata) VALUES
@@ -1505,28 +1545,28 @@ mod list_tracks_tests {
                 (10, 1, 1, 2),
                 (11, 1, 1, 1),
                 (12, 1, 2, 1);
-            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_item_id) VALUES
-                (10, 'track', 'filesystem_local', '/m/10.flac'),
-                (11, 'track', 'filesystem_local', '/m/11.flac'),
-                (12, 'track', 'filesystem_local', '/m/12.flac'),
-                (13, 'track', 'filesystem_local', '/m/13.flac'),
-                (14, 'track', 'filesystem_local', '/m/14.flac');
+            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_instance, provider_item_id) VALUES
+                (10, 'track', 'filesystem_local', 'filesystem_local--test', '/m/10.flac'),
+                (11, 'track', 'filesystem_local', 'filesystem_local--test', '/m/11.flac'),
+                (12, 'track', 'filesystem_local', 'filesystem_local--test', '/m/12.flac'),
+                (13, 'track', 'filesystem_local', 'filesystem_local--test', '/m/13.flac'),
+                (14, 'track', 'filesystem_local', 'filesystem_local--test', '/m/14.flac');
 
             -- Track A: high energy, fast bpm
-            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
-                ('/m/10.flac', 'sonic_analysis', '{\"energy\": 0.9}'),
-                ('/m/10.flac', 'smart_fades', '{\"bpm\": 140.0}');
+            INSERT INTO audio_analysis (item_id, provider, aa_provider_domain, analysis_data) VALUES
+                ('/m/10.flac', 'filesystem_local--test', 'sonic_analysis', '{\"energy\": 0.9}'),
+                ('/m/10.flac', 'filesystem_local--test', 'smart_fades', '{\"bpm\": 140.0}');
             -- Track B: low energy, slow bpm
-            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
-                ('/m/11.flac', 'sonic_analysis', '{\"energy\": 0.1}'),
-                ('/m/11.flac', 'smart_fades', '{\"bpm\": 80.0}');
+            INSERT INTO audio_analysis (item_id, provider, aa_provider_domain, analysis_data) VALUES
+                ('/m/11.flac', 'filesystem_local--test', 'sonic_analysis', '{\"energy\": 0.1}'),
+                ('/m/11.flac', 'filesystem_local--test', 'smart_fades', '{\"bpm\": 80.0}');
             -- Track C: high energy, fast bpm, different genre
-            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
-                ('/m/12.flac', 'sonic_analysis', '{\"energy\": 0.95}'),
-                ('/m/12.flac', 'smart_fades', '{\"bpm\": 145.0}');
+            INSERT INTO audio_analysis (item_id, provider, aa_provider_domain, analysis_data) VALUES
+                ('/m/12.flac', 'filesystem_local--test', 'sonic_analysis', '{\"energy\": 0.95}'),
+                ('/m/12.flac', 'filesystem_local--test', 'smart_fades', '{\"bpm\": 145.0}');
             -- Track D: loudness only, no sonic/bpm analysis at all
-            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
-                ('/m/13.flac', 'loudness_analysis', '{\"loudness_integrated\": -8.0}');
+            INSERT INTO audio_analysis (item_id, provider, aa_provider_domain, analysis_data) VALUES
+                ('/m/13.flac', 'filesystem_local--test', 'loudness_analysis', '{\"loudness_integrated\": -8.0}');
             -- Track E: no analysis whatsoever
             ",
         )
@@ -1741,16 +1781,17 @@ mod lyrics_tests {
             CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER, album_type TEXT, metadata TEXT);
             CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
             CREATE TABLE provider_mappings (
-                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+                item_id INTEGER, media_type TEXT, provider_domain TEXT,
+                provider_instance TEXT, provider_item_id TEXT
             );
-            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+            CREATE TABLE audio_analysis (item_id TEXT, provider TEXT, aa_provider_domain TEXT, analysis_data TEXT);
 
             INSERT INTO tracks (item_id, name, metadata) VALUES
                 (20, 'Dead People', '{\"genres\": [\"Hip Hop\"], \"lyrics\": \"I''m a handle business\"}');
-            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_item_id)
-                VALUES (20, 'track', 'filesystem_local', '/m/20.flac');
-            INSERT INTO audio_analysis (item_id, aa_provider_domain, analysis_data) VALUES
-                ('/m/20.flac', 'smart_fades', '{\"bpm\": 90.0, \"downbeats\": [0.5, 2.5], \"beats_per_bar\": 4.0}');
+            INSERT INTO provider_mappings (item_id, media_type, provider_domain, provider_instance, provider_item_id)
+                VALUES (20, 'track', 'filesystem_local', 'filesystem_local--test', '/m/20.flac');
+            INSERT INTO audio_analysis (item_id, provider, aa_provider_domain, analysis_data) VALUES
+                ('/m/20.flac', 'filesystem_local--test', 'smart_fades', '{\"bpm\": 90.0, \"downbeats\": [0.5, 2.5], \"beats_per_bar\": 4.0}');
             ",
         )
         .unwrap();
@@ -1846,9 +1887,10 @@ mod genre_taxonomy_tests {
             CREATE TABLE albums (item_id INTEGER PRIMARY KEY, name TEXT, year INTEGER, timestamp_added INTEGER, album_type TEXT, metadata TEXT);
             CREATE TABLE album_tracks (track_id INTEGER, album_id INTEGER, disc_number INTEGER, track_number INTEGER);
             CREATE TABLE provider_mappings (
-                item_id INTEGER, media_type TEXT, provider_domain TEXT, provider_item_id TEXT
+                item_id INTEGER, media_type TEXT, provider_domain TEXT,
+                provider_instance TEXT, provider_item_id TEXT
             );
-            CREATE TABLE audio_analysis (item_id TEXT, aa_provider_domain TEXT, analysis_data TEXT);
+            CREATE TABLE audio_analysis (item_id TEXT, provider TEXT, aa_provider_domain TEXT, analysis_data TEXT);
             CREATE TABLE genres (
                 item_id INTEGER PRIMARY KEY, name TEXT, description TEXT, genre_aliases TEXT
             );
